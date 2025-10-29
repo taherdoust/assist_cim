@@ -1,0 +1,51 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment variables
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# ========================================
+# Evaluation Results (Can Be Large)
+# ========================================
+
+# Evaluation results and benchmarks
+results/
+evaluation_results/
+*.jsonl
+
+# Keep small result summaries
+!*_summary.json
+
+# Agent logs (can grow large)
+*.log
+logs/
+
+# Temporary query results
+tmp/
+temp/
+cache/
