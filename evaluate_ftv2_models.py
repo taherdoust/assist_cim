@@ -11,36 +11,59 @@ Evaluates LLM models on FTv2 benchmark across three training modes:
 Metrics:
 - EM (Exact Match): Generated output exactly matches ground truth
 - EX (Execution Accuracy): Generated SQL produces same results
+- EA (Eventual Accuracy): Accuracy with iteration and feedback (agent mode)
 - Semantic Similarity: Cosine similarity of instruction embeddings
 - Downstream Accuracy: Does generated instruction lead to correct SQL?
 
+Model Sources:
+- HuggingFace fine-tuned models: hf:model_name
+- Ollama local models: ollama:model_name
+- OpenRouter API models: openrouter:provider/model_name
+
+EA (Agent Mode):
+- Enables iteration with execution feedback (max iterations configurable)
+- Model sees error message and tries again
+- Calculates: first-shot accuracy, eventual accuracy, self-correction rate
+- EA score: 1.0 (first-shot) or 1.0 - 0.15*(iterations-1) (corrected)
+
 Usage:
-    # Q2SQL mode
+    # Q2SQL mode (first-shot)
     python evaluate_ftv2_models.py \
         --benchmark ../ai4db/ftv2_evaluation_benchmark.jsonl \
         --model hf:taherdoust/qwen25-14b-cim-q2sql \
         --mode Q2SQL
 
-    # QInst2SQL mode
+    # Q2SQL mode (EA with agent)
     python evaluate_ftv2_models.py \
         --benchmark ../ai4db/ftv2_evaluation_benchmark.jsonl \
-        --model hf:taherdoust/qwen25-14b-cim-qinst2sql \
-        --mode QInst2SQL
+        --model hf:taherdoust/qwen25-14b-cim-q2sql \
+        --mode Q2SQL \
+        --agent_mode \
+        --max_iterations 5
 
-    # Q2Inst mode (hybrid evaluation)
+    # Plain model with schema context
     python evaluate_ftv2_models.py \
         --benchmark ../ai4db/ftv2_evaluation_benchmark.jsonl \
-        --model hf:taherdoust/qwen25-14b-cim-q2inst \
-        --mode Q2Inst \
-        --downstream_model hf:taherdoust/qwen25-14b-cim-qinst2sql
+        --model ollama:qwen2.5-coder:14b \
+        --mode Q2SQL \
+        --include_schema
+
+    # OpenRouter API model
+    python evaluate_ftv2_models.py \
+        --benchmark ../ai4db/ftv2_evaluation_benchmark.jsonl \
+        --model openrouter:anthropic/claude-3.5-sonnet \
+        --mode Q2SQL \
+        --include_schema \
+        --openrouter_api_key YOUR_KEY
 
 Author: Ali Taherdoust
-Date: October 2025
+Date: November 2025
 """
 
 import argparse
 import json
 import sys
+import os
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import time
@@ -53,6 +76,19 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 import numpy as np
 from tqdm import tqdm
+import requests
+
+
+def load_database_schema() -> str:
+    """Load CIM database schema for context."""
+    schema_file = Path(__file__).parent / "CIM_DATABASE_SCHEMA.txt"
+    
+    if schema_file.exists():
+        with open(schema_file, 'r', encoding='utf-8') as f:
+            return f.read()
+    else:
+        print(f"Warning: Schema file not found at {schema_file}")
+        return "# CIM Database Schema\nSchema information not available."
 
 
 def load_benchmark(benchmark_file: Path) -> List[Dict[str, Any]]:
@@ -69,8 +105,8 @@ def load_benchmark(benchmark_file: Path) -> List[Dict[str, Any]]:
     return samples
 
 
-def load_model(model_spec: str):
-    """Load model from HuggingFace or Ollama."""
+def load_model(model_spec: str, openrouter_api_key: Optional[str] = None):
+    """Load model from HuggingFace, Ollama, or OpenRouter."""
     print(f"\nLoading model: {model_spec}")
     
     if model_spec.startswith('hf:'):
@@ -91,8 +127,21 @@ def load_model(model_spec: str):
         print(f"Ollama model: {model_name}")
         return {'type': 'ollama', 'model_name': model_name}
     
+    elif model_spec.startswith('openrouter:'):
+        model_name = model_spec[11:]
+        print(f"OpenRouter API model: {model_name}")
+        
+        if not openrouter_api_key:
+            api_key = os.getenv('OPENROUTER_API_KEY')
+            if not api_key:
+                raise ValueError("OpenRouter API key required. Set OPENROUTER_API_KEY env var or use --openrouter_api_key")
+        else:
+            api_key = openrouter_api_key
+        
+        return {'type': 'openrouter', 'model_name': model_name, 'api_key': api_key}
+    
     else:
-        raise ValueError(f"Unknown model spec: {model_spec}. Use hf:model_name or ollama:model_name")
+        raise ValueError(f"Unknown model spec: {model_spec}. Use hf:model_name, ollama:model_name, or openrouter:provider/model_name")
 
 
 def generate_hf(model_dict: Dict, prompt: str, max_tokens: int = 512) -> str:
@@ -122,8 +171,6 @@ def generate_hf(model_dict: Dict, prompt: str, max_tokens: int = 512) -> str:
 
 def generate_ollama(model_name: str, prompt: str) -> str:
     """Generate response from Ollama model."""
-    import requests
-    
     response = requests.post(
         'http://localhost:11434/api/generate',
         json={'model': model_name, 'prompt': prompt, 'stream': False}
@@ -132,9 +179,41 @@ def generate_ollama(model_name: str, prompt: str) -> str:
     return response.json()['response']
 
 
-def create_prompt_q2sql(question: str, model_type: str) -> str:
+def generate_openrouter(model_name: str, api_key: str, prompt: str, max_tokens: int = 512) -> str:
+    """Generate response from OpenRouter API model."""
+    response = requests.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://github.com/taherdoust/coesi',
+            'X-Title': 'CIM Wizard FTv2 Evaluation'
+        },
+        json={
+            'model': model_name,
+            'messages': [{'role': 'user', 'content': prompt}],
+            'max_tokens': max_tokens,
+            'temperature': 0.1
+        },
+        timeout=60
+    )
+    
+    if response.status_code != 200:
+        raise Exception(f"OpenRouter API error: {response.status_code} - {response.text}")
+    
+    return response.json()['choices'][0]['message']['content']
+
+
+def create_prompt_q2sql(question: str, model_type: str, schema_context: Optional[str] = None) -> str:
     """Create prompt for Q2SQL task."""
-    system_msg = """You are an expert in PostGIS spatial SQL for City Information Modeling.
+    if schema_context:
+        system_msg = f"""You are an expert in PostGIS spatial SQL for City Information Modeling.
+Generate only the SQL query without explanations.
+
+Database Schema:
+{schema_context}"""
+    else:
+        system_msg = """You are an expert in PostGIS spatial SQL for City Information Modeling.
 Generate only the SQL query without explanations."""
     
     if model_type == 'qwen':
@@ -144,7 +223,7 @@ Generate only the SQL query without explanations."""
 {question}<|im_end|>
 <|im_start|>assistant
 """
-    else:  # llama
+    elif model_type == 'llama':
         return f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 {system_msg}<|eot_id|><|start_header_id|>user<|end_header_id|>
@@ -152,6 +231,12 @@ Generate only the SQL query without explanations."""
 {question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
+    else:  # openrouter or plain
+        return f"""{system_msg}
+
+Question: {question}
+
+SQL Query:"""
 
 
 def create_prompt_qinst2sql(question: str, instruction: str, model_type: str) -> str:
