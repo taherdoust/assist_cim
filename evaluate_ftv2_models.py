@@ -334,6 +334,117 @@ def compute_semantic_similarity(text1: str, text2: str, model: SentenceTransform
     return float(similarity)
 
 
+def calculate_performance_breakdowns(results: List[Dict[str, Any]], benchmark: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Calculate performance breakdowns across difficulty dimensions.
+    
+    Dimensions analyzed:
+    - Query Complexity (EASY, MEDIUM, HARD)
+    - Spatial Complexity (NONE, BASIC, INTERMEDIATE, ADVANCED)
+    - Schema Complexity (SINGLE_TABLE, SINGLE_SCHEMA, MULTI_SCHEMA)
+    - Complexity Level (A, B, C)
+    - SQL Type
+    - Function Count (0, 1, 2, 3+)
+    - Join Count (0, 1, 2+)
+    """
+    from collections import defaultdict
+    
+    breakdowns = {
+        'query_complexity': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0}),
+        'spatial_complexity': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0}),
+        'schema_complexity': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0}),
+        'complexity_level': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0}),
+        'sql_type': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0}),
+        'function_count': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0}),
+        'join_count': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0})
+    }
+    
+    # Match results with benchmark metadata
+    for result in results:
+        benchmark_id = result['benchmark_id']
+        # Find corresponding benchmark item
+        bench_item = next((item for item in benchmark if item['benchmark_id'] == benchmark_id), None)
+        
+        if not bench_item:
+            continue
+        
+        em = result.get('em', False)
+        ex = result.get('ex', False)
+        
+        # Query complexity
+        query_complexity = bench_item.get('query_complexity', 'UNKNOWN')
+        breakdowns['query_complexity'][query_complexity]['total'] += 1
+        if em:
+            breakdowns['query_complexity'][query_complexity]['em_correct'] += 1
+        if ex:
+            breakdowns['query_complexity'][query_complexity]['ex_correct'] += 1
+        
+        # Spatial complexity
+        spatial_complexity = bench_item.get('spatial_complexity', 'UNKNOWN')
+        breakdowns['spatial_complexity'][spatial_complexity]['total'] += 1
+        if em:
+            breakdowns['spatial_complexity'][spatial_complexity]['em_correct'] += 1
+        if ex:
+            breakdowns['spatial_complexity'][spatial_complexity]['ex_correct'] += 1
+        
+        # Schema complexity
+        schema_complexity = bench_item.get('schema_complexity', 'UNKNOWN')
+        breakdowns['schema_complexity'][schema_complexity]['total'] += 1
+        if em:
+            breakdowns['schema_complexity'][schema_complexity]['em_correct'] += 1
+        if ex:
+            breakdowns['schema_complexity'][schema_complexity]['ex_correct'] += 1
+        
+        # Complexity level
+        complexity_level = bench_item.get('complexity_level', 'UNKNOWN')
+        breakdowns['complexity_level'][complexity_level]['total'] += 1
+        if em:
+            breakdowns['complexity_level'][complexity_level]['em_correct'] += 1
+        if ex:
+            breakdowns['complexity_level'][complexity_level]['ex_correct'] += 1
+        
+        # SQL type
+        sql_type = bench_item.get('sql_type', 'UNKNOWN')
+        breakdowns['sql_type'][sql_type]['total'] += 1
+        if em:
+            breakdowns['sql_type'][sql_type]['em_correct'] += 1
+        if ex:
+            breakdowns['sql_type'][sql_type]['ex_correct'] += 1
+        
+        # Function count
+        function_count = bench_item.get('function_count', '0')
+        breakdowns['function_count'][function_count]['total'] += 1
+        if em:
+            breakdowns['function_count'][function_count]['em_correct'] += 1
+        if ex:
+            breakdowns['function_count'][function_count]['ex_correct'] += 1
+        
+        # Join count
+        join_count = bench_item.get('join_count', '0')
+        breakdowns['join_count'][join_count]['total'] += 1
+        if em:
+            breakdowns['join_count'][join_count]['em_correct'] += 1
+        if ex:
+            breakdowns['join_count'][join_count]['ex_correct'] += 1
+    
+    # Calculate accuracy percentages
+    breakdown_results = {}
+    for dimension, stats in breakdowns.items():
+        breakdown_results[dimension] = {}
+        for category, counts in stats.items():
+            total = counts['total']
+            if total > 0:
+                breakdown_results[dimension][category] = {
+                    'total': total,
+                    'em_correct': counts['em_correct'],
+                    'ex_correct': counts['ex_correct'],
+                    'em_accuracy': counts['em_correct'] / total,
+                    'ex_accuracy': counts['ex_correct'] / total
+                }
+    
+    return breakdown_results
+
+
 def evaluate_q2sql(
     benchmark: List[Dict[str, Any]],
     model_dict: Dict,
@@ -379,6 +490,10 @@ def evaluate_q2sql(
         })
     
     total = len(benchmark)
+    
+    # Calculate performance breakdowns
+    breakdowns = calculate_performance_breakdowns(results, benchmark)
+    
     return {
         'mode': 'Q2SQL',
         'total_samples': total,
@@ -386,6 +501,7 @@ def evaluate_q2sql(
         'ex_correct': ex_correct,
         'em_accuracy': em_correct / total if total > 0 else 0,
         'ex_accuracy': ex_correct / total if total > 0 else 0,
+        'performance_breakdowns': breakdowns,
         'results': results
     }
 
@@ -437,6 +553,10 @@ def evaluate_qinst2sql(
         })
     
     total = len(benchmark)
+    
+    # Calculate performance breakdowns
+    breakdowns = calculate_performance_breakdowns(results, benchmark)
+    
     return {
         'mode': 'QInst2SQL',
         'total_samples': total,
@@ -444,6 +564,7 @@ def evaluate_qinst2sql(
         'ex_correct': ex_correct,
         'em_accuracy': em_correct / total if total > 0 else 0,
         'ex_accuracy': ex_correct / total if total > 0 else 0,
+        'performance_breakdowns': breakdowns,
         'results': results
     }
 
@@ -540,6 +661,34 @@ def evaluate_q2inst(
     }
 
 
+def print_breakdowns(breakdowns: Dict[str, Any]):
+    """Print performance breakdowns in a formatted way."""
+    print("\n" + "="*70)
+    print("PERFORMANCE BREAKDOWN BY DIFFICULTY DIMENSIONS")
+    print("="*70)
+    
+    dimension_names = {
+        'query_complexity': 'Query Complexity',
+        'spatial_complexity': 'Spatial Complexity',
+        'schema_complexity': 'Schema Complexity',
+        'complexity_level': 'Complexity Level',
+        'sql_type': 'SQL Type',
+        'function_count': 'Function Count',
+        'join_count': 'Join Count'
+    }
+    
+    for dimension, name in dimension_names.items():
+        if dimension in breakdowns and breakdowns[dimension]:
+            print(f"\n{name}:")
+            print(f"  {'Category':<20} {'Total':<8} {'EM %':<10} {'EX %':<10}")
+            print(f"  {'-'*50}")
+            for category, stats in sorted(breakdowns[dimension].items()):
+                total = stats['total']
+                em_pct = stats['em_accuracy'] * 100
+                ex_pct = stats['ex_accuracy'] * 100
+                print(f"  {category:<20} {total:<8} {em_pct:<10.1f} {ex_pct:<10.1f}")
+
+
 def save_results(evaluation_results: Dict[str, Any], output_file: Path):
     """Save evaluation results."""
     print(f"\nSaving results to: {output_file}")
@@ -628,6 +777,10 @@ def main():
         print(f"  Total samples: {results['total_samples']}")
         print(f"  EM accuracy: {results['em_accuracy']*100:.2f}%")
         print(f"  EX accuracy: {results['ex_accuracy']*100:.2f}%")
+        
+        # Print performance breakdowns
+        if 'performance_breakdowns' in results:
+            print_breakdowns(results['performance_breakdowns'])
     elif args.mode == 'Q2Inst':
         print(f"\nResults:")
         print(f"  Total samples: {results['total_samples']}")
