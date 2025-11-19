@@ -346,6 +346,7 @@ def calculate_performance_breakdowns(results: List[Dict[str, Any]], benchmark: L
     - SQL Type
     - Function Count (0, 1, 2, 3+)
     - Join Count (0, 1, 2+)
+    - Question Tone
     """
     from collections import defaultdict
     
@@ -356,7 +357,8 @@ def calculate_performance_breakdowns(results: List[Dict[str, Any]], benchmark: L
         'complexity_level': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0}),
         'sql_type': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0}),
         'function_count': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0}),
-        'join_count': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0})
+        'join_count': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0}),
+        'question_tone': defaultdict(lambda: {'total': 0, 'em_correct': 0, 'ex_correct': 0})
     }
     
     # Match results with benchmark metadata
@@ -426,6 +428,14 @@ def calculate_performance_breakdowns(results: List[Dict[str, Any]], benchmark: L
             breakdowns['join_count'][join_count]['em_correct'] += 1
         if ex:
             breakdowns['join_count'][join_count]['ex_correct'] += 1
+        
+        # Question tone
+        tone = (bench_item.get('question_tone') or 'UNKNOWN').upper()
+        breakdowns['question_tone'][tone]['total'] += 1
+        if em:
+            breakdowns['question_tone'][tone]['em_correct'] += 1
+        if ex:
+            breakdowns['question_tone'][tone]['ex_correct'] += 1
     
     # Calculate accuracy percentages
     breakdown_results = {}
@@ -445,11 +455,54 @@ def calculate_performance_breakdowns(results: List[Dict[str, Any]], benchmark: L
     return breakdown_results
 
 
+def compute_tone_robustness(
+    breakdowns: Dict[str, Any],
+    primary_tone: str
+) -> Optional[Dict[str, float]]:
+    """Compute robustness metrics for question tones."""
+    tone_stats = breakdowns.get('question_tone')
+    if not tone_stats:
+        return None
+    
+    primary = (primary_tone or 'INTERROGATIVE').upper()
+    
+    def aggregate(stats_items):
+        total = sum(item['total'] for item in stats_items)
+        ex_correct = sum(item['ex_correct'] for item in stats_items)
+        em_correct = sum(item['em_correct'] for item in stats_items)
+        return {
+            'total': total,
+            'em_accuracy': (em_correct / total) if total else 0.0,
+            'ex_accuracy': (ex_correct / total) if total else 0.0
+        }
+    
+    primary_stats = tone_stats.get(primary)
+    variants_stats = [v for k, v in tone_stats.items() if k != primary]
+    
+    primary_summary = aggregate([primary_stats]) if primary_stats else {'total': 0, 'em_accuracy': 0.0, 'ex_accuracy': 0.0}
+    variant_summary = aggregate(variants_stats) if variants_stats else {'total': 0, 'em_accuracy': 0.0, 'ex_accuracy': 0.0}
+    
+    ex_gap = primary_summary['ex_accuracy'] - variant_summary['ex_accuracy']
+    
+    robustness_score = 0.0
+    if primary_summary['ex_accuracy'] > 0:
+        robustness_score = variant_summary['ex_accuracy'] / primary_summary['ex_accuracy']
+    
+    return {
+        'primary_tone': primary,
+        'primary_ex_accuracy': primary_summary['ex_accuracy'],
+        'variant_ex_accuracy': variant_summary['ex_accuracy'],
+        'ex_gap': ex_gap,
+        'robustness_score': robustness_score
+    }
+
+
 def evaluate_q2sql(
     benchmark: List[Dict[str, Any]],
     model_dict: Dict,
     db_uri: str,
-    model_type: str
+    model_type: str,
+    primary_tone: str
 ) -> Dict[str, Any]:
     """Evaluate Q2SQL mode: Question → SQL."""
     print("\nEvaluating Q2SQL mode...")
@@ -493,6 +546,7 @@ def evaluate_q2sql(
     
     # Calculate performance breakdowns
     breakdowns = calculate_performance_breakdowns(results, benchmark)
+    tone_robustness = compute_tone_robustness(breakdowns, primary_tone)
     
     return {
         'mode': 'Q2SQL',
@@ -501,6 +555,7 @@ def evaluate_q2sql(
         'ex_correct': ex_correct,
         'em_accuracy': em_correct / total if total > 0 else 0,
         'ex_accuracy': ex_correct / total if total > 0 else 0,
+        'tone_robustness': tone_robustness,
         'performance_breakdowns': breakdowns,
         'results': results
     }
@@ -510,7 +565,8 @@ def evaluate_qinst2sql(
     benchmark: List[Dict[str, Any]],
     model_dict: Dict,
     db_uri: str,
-    model_type: str
+    model_type: str,
+    primary_tone: str
 ) -> Dict[str, Any]:
     """Evaluate QInst2SQL mode: Question + Instruction → SQL."""
     print("\nEvaluating QInst2SQL mode...")
@@ -556,6 +612,7 @@ def evaluate_qinst2sql(
     
     # Calculate performance breakdowns
     breakdowns = calculate_performance_breakdowns(results, benchmark)
+    tone_robustness = compute_tone_robustness(breakdowns, primary_tone)
     
     return {
         'mode': 'QInst2SQL',
@@ -564,6 +621,7 @@ def evaluate_qinst2sql(
         'ex_correct': ex_correct,
         'em_accuracy': em_correct / total if total > 0 else 0,
         'ex_accuracy': ex_correct / total if total > 0 else 0,
+        'tone_robustness': tone_robustness,
         'performance_breakdowns': breakdowns,
         'results': results
     }
@@ -674,7 +732,8 @@ def print_breakdowns(breakdowns: Dict[str, Any]):
         'complexity_level': 'Complexity Level',
         'sql_type': 'SQL Type',
         'function_count': 'Function Count',
-        'join_count': 'Join Count'
+        'join_count': 'Join Count',
+        'question_tone': 'Question Tone'
     }
     
     for dimension, name in dimension_names.items():
@@ -725,6 +784,9 @@ def main():
                        help='Database URI')
     parser.add_argument('--output', type=Path,
                        help='Output file for results (default: auto-generated)')
+    parser.add_argument('--primary_tone', type=str,
+                       default='INTERROGATIVE',
+                       help='Primary question tone for robustness analysis (default: INTERROGATIVE)')
     
     args = parser.parse_args()
     
@@ -742,9 +804,9 @@ def main():
         downstream_model_dict = load_model(args.downstream_model)
     
     if args.mode == 'Q2SQL':
-        results = evaluate_q2sql(benchmark, model_dict, args.db_uri, args.model_type)
+        results = evaluate_q2sql(benchmark, model_dict, args.db_uri, args.model_type, args.primary_tone)
     elif args.mode == 'QInst2SQL':
-        results = evaluate_qinst2sql(benchmark, model_dict, args.db_uri, args.model_type)
+        results = evaluate_qinst2sql(benchmark, model_dict, args.db_uri, args.model_type, args.primary_tone)
     elif args.mode == 'Q2Inst':
         results = evaluate_q2inst(
             benchmark,
@@ -777,10 +839,24 @@ def main():
         print(f"  Total samples: {results['total_samples']}")
         print(f"  EM accuracy: {results['em_accuracy']*100:.2f}%")
         print(f"  EX accuracy: {results['ex_accuracy']*100:.2f}%")
+        if results.get('tone_robustness'):
+            rb = results['tone_robustness']
+            print(f"  Tone robustness (EX): primary {rb['primary_ex_accuracy']*100:.1f}%, "
+                  f"variants {rb['variant_ex_accuracy']*100:.1f}%, gap {rb['ex_gap']*100:.1f}pp, "
+                  f"score {rb['robustness_score']:.2f}")
         
         # Print performance breakdowns
         if 'performance_breakdowns' in results:
             print_breakdowns(results['performance_breakdowns'])
+            sql_type_stats = results['performance_breakdowns'].get('sql_type', {})
+            if sql_type_stats:
+                ranked = sorted(sql_type_stats.items(), key=lambda x: x[1]['ex_accuracy'], reverse=True)
+                if ranked:
+                    best = ranked[0]
+                    worst = ranked[-1]
+                    print(f"\nSQL type EX accuracy range: best {best[0]} "
+                          f"{best[1]['ex_accuracy']*100:.1f}%, worst {worst[0]} "
+                          f"{worst[1]['ex_accuracy']*100:.1f}%")
     elif args.mode == 'Q2Inst':
         print(f"\nResults:")
         print(f"  Total samples: {results['total_samples']}")
