@@ -267,27 +267,45 @@ def generate_openrouter(model_name: str, api_key: str, prompt: str, max_tokens: 
 def extract_sql_from_response(response: str) -> str:
     """Extract clean SQL from model response."""
     import re
+    
+    # Step 1: Remove ALL chat template tokens
     for marker in ['<|im_start|>', '<|im_end|>', '<|begin_of_text|>', '<|eot_id|>', 
                    '<|start_header_id|>', '<|end_header_id|>']:
         response = response.replace(marker, '')
+    
+    # Step 2: Remove role labels (assistant, user, system) as standalone words
+    response = re.sub(r'\b(assistant|user|system)\b', '', response, flags=re.IGNORECASE)
+    
+    # Step 3: Split by "assistant" marker if present
     assistant_match = re.search(r'assistant\s*\n+(.*)', response, re.DOTALL | re.IGNORECASE)
     if assistant_match:
         response = assistant_match.group(1).strip()
     else:
         response = re.sub(r'^(system|user|assistant)\s*\n', '', response, flags=re.MULTILINE | re.IGNORECASE)
+    
+    # Step 4: Extract from code blocks
     code_block_match = re.search(r'```(?:sql)?\s*\n(.*?)\n```', response, re.DOTALL | re.IGNORECASE)
     if code_block_match:
-        return code_block_match.group(1).strip()
-    sql_match = re.search(
-        r'\b((?:WITH|SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b.*?)(?:\n\n|$)',
-        response,
-        re.DOTALL | re.IGNORECASE
-    )
-    if sql_match:
-        candidate = sql_match.group(1).strip()
-        candidate = re.sub(r'\n\s*(?:Note|Explanation|This query).*$', '', candidate, flags=re.IGNORECASE | re.DOTALL)
-        return candidate
-    return response.strip()
+        sql = code_block_match.group(1).strip()
+    else:
+        # Step 5: Extract SQL statement
+        sql_match = re.search(
+            r'\b((?:WITH|SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b.*?)(?:\n\n|$)',
+            response,
+            re.DOTALL | re.IGNORECASE
+        )
+        if sql_match:
+            sql = sql_match.group(1).strip()
+        else:
+            sql = response.strip()
+    
+    # Step 6: Remove trailing role labels
+    sql = re.sub(r'\s+(assistant|user|system)\s*$', '', sql, flags=re.IGNORECASE)
+    
+    # Step 7: Remove explanatory text after SQL
+    sql = re.sub(r'\n\s*(?:Note|Explanation|This query).*$', '', sql, flags=re.IGNORECASE | re.DOTALL)
+    
+    return sql.strip()
 
 
 def fix_common_sql_errors(sql: str) -> str:
@@ -501,19 +519,19 @@ def generate_sql_node(state: AgentState) -> AgentState:
 
 def is_subset_match(generated_result: list, ground_truth_result: list) -> bool:
     """
-    Check if ground truth results are a subset of generated results.
+    Check if GENERATED results are a subset of GROUND TRUTH results.
     This allows for:
-    - Model returning more rows than ground truth (e.g., no LIMIT or higher LIMIT)
+    - Model returning FEWER rows (e.g., with LIMIT)
     - Different ordering (ORDER BY variations)
     
-    Returns True if all ground truth rows are present in generated results.
+    Returns True if all generated rows are present in ground truth.
     """
-    if not ground_truth_result:
-        # Empty ground truth matches empty or any result
+    if not generated_result:
+        # Empty generated result is acceptable
         return True
     
-    if not generated_result:
-        # Non-empty ground truth doesn't match empty result
+    if not ground_truth_result:
+        # Non-empty generated but empty ground truth: mismatch
         return False
     
     # Convert to sets of tuples for efficient lookup
@@ -527,8 +545,8 @@ def is_subset_match(generated_result: list, ground_truth_result: list) -> bool:
         ground_truth_set = {to_hashable(row) for row in ground_truth_result}
         generated_set = {to_hashable(row) for row in generated_result}
         
-        # Check if ground truth is subset of generated
-        return ground_truth_set.issubset(generated_set)
+        # FIX: Check if GENERATED is subset of GROUND TRUTH (not the other way!)
+        return generated_set.issubset(ground_truth_set)
     except (TypeError, ValueError):
         # Fallback to exact match if unhashable types
         return generated_result == ground_truth_result
