@@ -38,6 +38,8 @@ results/
 evaluation_results/
 *.jsonl
 
+ea_artifacts/
+
 # Keep small result summaries
 !*_summary.json
 
