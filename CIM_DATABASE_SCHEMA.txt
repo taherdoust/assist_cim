@@ -1,182 +1,71 @@
-# CIM Wizard Database Schema - Comprehensive Reference
+# CIM Wizard Database Schema
 
-## Database Architecture
-PostgreSQL 12+ with PostGIS 3.0+ extension
-Three specialized schemas: cim_vector, cim_census, cim_raster
-
-## 1. CIM_VECTOR Schema - Building & Project Data
-
-### cim_vector.cim_wizard_project_scenario
-Project and scenario management for urban modeling
-- project_id VARCHAR(100) PRIMARY KEY
-- scenario_id VARCHAR(100) PRIMARY KEY  
-- project_name VARCHAR(255)
-- scenario_name VARCHAR(255)
-- project_boundary GEOMETRY(POLYGON, 4326)
-- project_center GEOMETRY(POINT, 4326)
-- created_at TIMESTAMP WITH TIME ZONE
-- updated_at TIMESTAMP WITH TIME ZONE
+## Core Tables
 
 ### cim_vector.cim_wizard_building
-Building geometries and identification
-- id SERIAL PRIMARY KEY
-- building_id VARCHAR(100) - Business key
-- lod INTEGER - Level of detail (0=footprint, 1=with height, 2=detailed)
-- building_geometry GEOMETRY(GEOMETRY, 4326) - Building footprint
-- building_geometry_source VARCHAR(50) - Data source (osm, catasto, lidar)
+Building footprints and identification
+- building_id VARCHAR(100) - Unique building identifier
+- building_geometry GEOMETRY(GEOMETRY, 4326) - Building footprint polygon
 - census_id BIGINT - Link to census zone (SEZ2011)
-- created_at TIMESTAMP WITH TIME ZONE
-- updated_at TIMESTAMP WITH TIME ZONE
+- lod INTEGER - Level of detail (0=footprint, 1=with height, 2=detailed)
 
-### cim_vector.cim_wizard_building_properties  
-Calculated building characteristics and properties
-- id SERIAL PRIMARY KEY
-- building_id VARCHAR(100) FOREIGN KEY
-- project_id VARCHAR(100) FOREIGN KEY
-- scenario_id VARCHAR(100) FOREIGN KEY
-- lod INTEGER
-- height FLOAT - Building height in meters (DSM-DTM or estimated)
+### cim_vector.cim_wizard_building_properties
+Building characteristics and energy properties
+- building_id VARCHAR(100) - Links to cim_wizard_building
+- project_id VARCHAR(100), scenario_id VARCHAR(100) - Project context
+- height FLOAT - Building height in meters
 - area FLOAT - Footprint area in square meters
 - volume FLOAT - Building volume (height × area)
-- number_of_floors FLOAT - Estimated floors (height ÷ floor_height)
-- type VARCHAR(50) - Building use type (residential, commercial, industrial)
-- const_period_census VARCHAR(10) - ISTAT construction period (E8, E12, E16)
-- const_year INTEGER - Estimated construction year
-- const_TABULA VARCHAR(15) - TABULA energy efficiency period
-- n_people INTEGER - Estimated residents/occupants
-- n_family INTEGER - Estimated family units
-- gross_floor_area FLOAT - Total floor area (area × floors)
-- heating BOOLEAN - Has heating system
-- cooling BOOLEAN - Has cooling system
-- created_at TIMESTAMP WITH TIME ZONE
-- updated_at TIMESTAMP WITH TIME ZONE
+- number_of_floors FLOAT - Estimated floor count
+- type VARCHAR(50) - Building use (residential, commercial, industrial)
+- const_period_census VARCHAR(10) - Construction period (E8, E12, E16)
+- n_people INTEGER - Estimated occupants
+- gross_floor_area FLOAT - Total floor area
+
+### cim_vector.cim_wizard_project_scenario
+Project and scenario definitions
+- project_id VARCHAR(100), scenario_id VARCHAR(100) - Primary keys
+- project_name VARCHAR(255), scenario_name VARCHAR(255)
+- project_boundary GEOMETRY(POLYGON, 4326)
+
+### cim_census.censusgeo
+Italian census data (ISTAT 2011)
+- sez2011 BIGINT - Census section ID
+- census_geometry GEOMETRY(MULTIPOLYGON, 4326)
+- comune VARCHAR(50) - Municipality name
+- p1 INTEGER - Total population
+- st1 INTEGER - Total housing units
+- e8-e16 INTEGER - Building age distribution (e8=pre-1918, e16=post-2005)
+- pf1 INTEGER - Total families
 
 ### cim_vector.network_buses
-Electrical grid bus/node management
-- id SERIAL PRIMARY KEY
-- network_id VARCHAR(100)
-- bus_id INTEGER
-- project_id VARCHAR(100)
-- scenario_id VARCHAR(100)
+Electrical grid nodes
+- bus_id INTEGER, network_id VARCHAR(100)
+- project_id VARCHAR(100), scenario_id VARCHAR(100)
 - bus_geometry GEOMETRY(POINT, 4326)
-- bus_name VARCHAR(255)
-- voltage_kv FLOAT - Operating voltage in kilovolts
-- zone VARCHAR(50) - Grid zone (LV, MV, HV)
-- in_service BOOLEAN
+- voltage_kv FLOAT - Operating voltage
 
 ### cim_vector.network_lines
 Electrical transmission lines
-- id SERIAL PRIMARY KEY
-- network_id VARCHAR(100)
-- line_id INTEGER
-- project_id VARCHAR(100)
-- scenario_id VARCHAR(100)
+- line_id INTEGER, network_id VARCHAR(100)
+- project_id VARCHAR(100), scenario_id VARCHAR(100)
 - line_geometry GEOMETRY(LINESTRING, 4326)
-- line_name VARCHAR(255)
-- from_bus_id INTEGER - Source bus ID
-- to_bus_id INTEGER - Destination bus ID
+- from_bus_id INTEGER, to_bus_id INTEGER
 - length_km FLOAT
-- max_loading_percent FLOAT
 
-## 2. CIM_CENSUS Schema - Italian Demographic Data
+### cim_raster.dtm / cim_raster.dsm
+Digital terrain and surface models
+- rast RASTER - Elevation data
 
-### cim_census.censusgeo
-Italian National Census (ISTAT) data - Sezioni di Censimento 2011
-- id SERIAL PRIMARY KEY
-- sez2011 BIGINT - ISTAT Census Section ID (unique)
-- census_geometry GEOMETRY(MULTIPOLYGON, 4326)
-- shape_area FLOAT - Zone area in square meters
+## Key PostGIS Functions
+- ST_Intersects(geom1, geom2) - Test intersection
+- ST_Area(geom) - Calculate area
+- ST_Distance(geom1, geom2) - Calculate distance
+- ST_Buffer(geom, radius) - Create buffer
+- ST_Within(geom1, geom2) - Test containment
+- ST_Value(rast, geom) - Extract raster value
 
-Administrative hierarchy:
-- codreg VARCHAR(10) - Region code
-- regione VARCHAR(50) - Region name (Lombardia, Lazio, Piemonte)
-- codpro VARCHAR(10) - Province code
-- provincia VARCHAR(50) - Province name (Milano, Roma, Torino)
-- codcom VARCHAR(10) - Municipality code
-- comune VARCHAR(50) - Municipality name
-- procom VARCHAR(10) - Province+Municipality code
-- nsez VARCHAR(10) - Section number within municipality
-- ace VARCHAR(10) - Census enumeration area
-
-Population statistics (P1-P140):
-- p1 INTEGER - Total Population
-- p2 INTEGER - Males
-- p3 INTEGER - Females
-- p4-p66 INTEGER - Age groups, education, employment
-- p128-p140 INTEGER - Extended population attributes
-
-Housing statistics (ST1-ST15):
-- st1 INTEGER - Total Housing Units
-- st2 INTEGER - Occupied Housing Units
-- st3 INTEGER - Vacant Housing Units
-- st4-st15 INTEGER - Housing characteristics
-
-Building age distribution (E1-E31):
-- e8 INTEGER - Buildings before 1918
-- e9 INTEGER - Buildings 1919-1945
-- e10 INTEGER - Buildings 1946-1960
-- e11 INTEGER - Buildings 1961-1970
-- e12 INTEGER - Buildings 1971-1980
-- e13 INTEGER - Buildings 1981-1990
-- e14 INTEGER - Buildings 1991-2000
-- e15 INTEGER - Buildings 2001-2005
-- e16 INTEGER - Buildings after 2005
-
-Building attributes (A2-A48):
-- a2-a48 INTEGER - Building materials, condition, construction details
-
-Family statistics (PF1-PF9):
-- pf1 INTEGER - Total Families
-- pf2-pf9 INTEGER - Family size distribution
-
-## 3. CIM_RASTER Schema - Digital Terrain Models
-
-### cim_raster.dtm
-Digital Terrain Model - Ground elevation
-- rid SERIAL PRIMARY KEY
-- rast RASTER - Raster data
-- filename VARCHAR(255)
-
-### cim_raster.dsm  
-Digital Surface Model - Surface elevation (includes buildings)
-- rid SERIAL PRIMARY KEY
-- rast RASTER - Raster data
-- filename VARCHAR(255)
-
-## Common PostGIS Spatial Functions
-
-Spatial relationships:
-- ST_Intersects(geom1, geom2) - Tests if geometries intersect
-- ST_Within(geom1, geom2) - Tests if geom1 is within geom2
-- ST_Contains(geom1, geom2) - Tests if geom1 contains geom2
-- ST_DWithin(geom1, geom2, distance) - Tests if geometries are within distance
-- ST_Touches(geom1, geom2) - Tests if geometries touch boundaries
-
-Spatial measurements:
-- ST_Area(geom) - Returns area of geometry
-- ST_Distance(geom1, geom2) - Returns distance between geometries
-- ST_Length(geom) - Returns length of linestring
-- ST_Perimeter(geom) - Returns perimeter of polygon
-
-Spatial processing:
-- ST_Buffer(geom, radius) - Creates buffer around geometry
-- ST_Union(geom_set) - Combines geometries
-- ST_Intersection(geom1, geom2) - Returns intersection
-- ST_Centroid(geom) - Returns centroid point
-- ST_Transform(geom, srid) - Transforms to different coordinate system
-
-Raster functions:
-- ST_Value(rast, geom) - Extracts raster value at geometry location
-- ST_Clip(rast, geom) - Clips raster by geometry
-
-## Important Notes
-
-1. All spatial data uses WGS84 (SRID 4326)
-2. Census data is from ISTAT 2011 census
-3. Building heights calculated as: DSM - DTM
-4. TABULA periods reference Italian building energy efficiency classifications
-5. Project IDs are typically UUIDs or descriptive strings like 'sansalva_filter'
-6. All geometry columns use lowercase: building_geometry, census_geometry, bus_geometry, line_geometry
-7. All ID columns are lowercase: building_id, project_id, scenario_id, bus_id, line_id
-8. Census columns are lowercase unquoted: p1, e8, st1, pf1 (not "P1", "E8")
-
+## Notes
+- All geometries use SRID 4326 (WGS84)
+- Column names are lowercase: building_id, project_id, census_geometry
+- Census columns: p1, e8, st1, pf1 (lowercase, unquoted)

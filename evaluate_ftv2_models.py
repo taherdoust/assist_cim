@@ -65,7 +65,7 @@ import json
 import sys
 import os
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 import time
 from datetime import datetime
 
@@ -77,6 +77,148 @@ from sqlalchemy.pool import NullPool
 import numpy as np
 from tqdm import tqdm
 import requests
+
+# Load .env file if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, will use environment variables directly
+
+
+def sanitize_model_name(model_spec: str) -> str:
+    """
+    Convert a model spec into a filesystem-safe string.
+    Examples:
+        hf:taherdoust/qwen25 -> hf_taherdoust_qwen25
+        ollama:qwen2.5 -> ollama_qwen2_5
+    """
+    safe_chars = []
+    for char in model_spec:
+        if char.isalnum() or char in ('_', '-'):
+            safe_chars.append(char)
+        elif char in ('.', '/', ':'):
+            safe_chars.append('_')
+        else:
+            safe_chars.append('_')
+    return ''.join(safe_chars)
+
+
+def prepare_artifact_file(
+    artifacts_dir: Optional[Path],
+    mode: str,
+    model_spec: str
+) -> Optional[Path]:
+    """Return path to artifacts JSONL file (per model/mode) and reset it."""
+    if artifacts_dir is None:
+        return None
+    safe_model_name = sanitize_model_name(model_spec)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    mode_dir = artifacts_dir / mode.lower()
+    mode_dir.mkdir(parents=True, exist_ok=True)
+    artifact_file = mode_dir / f"{safe_model_name}_{timestamp}.jsonl"
+    if artifact_file.exists():
+        artifact_file.unlink()
+    artifact_file.touch()
+    return artifact_file
+
+
+def json_serializer(obj):
+    """Custom JSON serializer for objects not serializable by default json code."""
+    from uuid import UUID
+    from decimal import Decimal
+    from datetime import datetime, date
+    
+    if isinstance(obj, UUID):
+        return str(obj)
+    elif isinstance(obj, Decimal):
+        return float(obj)
+    elif isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    elif isinstance(obj, bytes):
+        return obj.decode('utf-8', errors='replace')
+    raise TypeError(f"Type {type(obj)} not serializable")
+
+
+def append_artifact(artifact_file: Optional[Path], record: Dict[str, Any]) -> None:
+    """Append a JSON record to the artifact file."""
+    if artifact_file is None:
+        return
+    with artifact_file.open('a', encoding='utf-8') as f:
+        f.write(json.dumps(record, ensure_ascii=False, default=json_serializer) + '\n')
+
+
+def remap_home_path(path: Path) -> Path:
+    """
+    If a path points to /home/<user>/... but the actual home is mounted elsewhere
+    (e.g., /media/space/<user>), remap it automatically.
+    """
+    home = Path.home()
+    user = os.getenv('USER', home.name)
+    canonical_home = Path('/home') / user
+    if not path.is_absolute():
+        return path
+    if canonical_home == home:
+        return path
+    try:
+        relative = path.relative_to(canonical_home)
+    except ValueError:
+        return path
+    return home / relative
+
+
+def resolve_cli_path(
+    path_value: str,
+    ensure_exists: bool = False,
+    description: str = "path"
+) -> Path:
+    """
+    Normalize CLI-provided paths:
+    - Expand user (~)
+    - Remap legacy /home/<user> prefixes when HOME is elsewhere
+    - Resolve relative paths against current working directory
+    """
+    if path_value is None:
+        raise ValueError(f"{description} is required.")
+    original_display = str(path_value)
+    candidate = Path(path_value).expanduser()
+    before_remap = candidate
+    candidate = remap_home_path(candidate)
+    if candidate != before_remap and candidate != Path(original_display):
+        print(f"[path] Remapped {description} from {original_display} to {candidate}")
+    if not candidate.is_absolute():
+        candidate = (Path.cwd() / candidate).resolve(strict=False)
+    else:
+        candidate = candidate.resolve(strict=False)
+    if ensure_exists and not candidate.exists():
+        print(f"Error: {description} not found: {candidate}")
+        sys.exit(1)
+    return candidate
+
+
+def normalize_hf_model_name(model_name: str) -> str:
+    """
+    Detect if the provided HuggingFace model name is actually a local path.
+    If so, resolve/remap it; otherwise return the original repo id.
+    """
+    candidate = Path(model_name).expanduser()
+    is_windows_drive = len(model_name) > 1 and model_name[1] == ':' and model_name[0].isalpha()
+    looks_like_path = (
+        model_name.startswith('/')
+        or model_name.startswith('./')
+        or model_name.startswith('../')
+        or model_name.startswith('~')
+        or is_windows_drive
+        or candidate.exists()
+    )
+    if not looks_like_path:
+        return model_name
+    resolved = resolve_cli_path(
+        str(candidate),
+        ensure_exists=True,
+        description='Model path'
+    )
+    return str(resolved)
 
 
 def load_database_schema() -> str:
@@ -111,6 +253,7 @@ def load_model(model_spec: str, openrouter_api_key: Optional[str] = None):
     
     if model_spec.startswith('hf:'):
         model_name = model_spec[3:]
+        model_name = normalize_hf_model_name(model_name)
         print(f"Loading HuggingFace model: {model_name}")
         
         tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -163,10 +306,88 @@ def generate_hf(model_dict: Dict, prompt: str, max_tokens: int = 512) -> str:
     
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
     
+    # Try to remove prompt if present
     if prompt in response:
         response = response[len(prompt):].strip()
     
     return response
+
+
+def extract_sql_from_response(response: str) -> str:
+    """
+    Extract clean SQL from model response, removing chat tags and explanations.
+    Handles various formats: plain SQL, SQL with markdown, SQL with chat tags.
+    """
+    import re
+    
+    # Remove common chat format markers
+    for marker in ['<|im_start|>', '<|im_end|>', '<|begin_of_text|>', '<|eot_id|>', 
+                   '<|start_header_id|>', '<|end_header_id|>']:
+        response = response.replace(marker, '')
+    
+    # Split by system/user/assistant markers to isolate the assistant's response
+    # Look for the last "assistant" section
+    assistant_match = re.search(r'assistant\s*\n+(.*)', response, re.DOTALL | re.IGNORECASE)
+    if assistant_match:
+        response = assistant_match.group(1).strip()
+    else:
+        # Remove system/user/assistant labels at start of lines as fallback
+        response = re.sub(r'^(system|user|assistant)\s*\n', '', response, flags=re.MULTILINE | re.IGNORECASE)
+    
+    # Extract SQL from markdown code blocks if present
+    code_block_match = re.search(r'```(?:sql)?\s*\n(.*?)\n```', response, re.DOTALL | re.IGNORECASE)
+    if code_block_match:
+        return code_block_match.group(1).strip()
+    
+    # Look for SELECT/WITH/INSERT/UPDATE/DELETE statements
+    # Use word boundary at start to avoid matching mid-sentence
+    sql_match = re.search(
+        r'\b((?:WITH|SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b.*?)(?:\n\n|$)',
+        response,
+        re.DOTALL | re.IGNORECASE
+    )
+    if sql_match:
+        candidate = sql_match.group(1).strip()
+        # Remove trailing explanatory text after SQL
+        candidate = re.sub(r'\n\s*(?:Note|Explanation|This query).*$', '', candidate, flags=re.IGNORECASE | re.DOTALL)
+        return candidate
+    
+    # Fallback: return cleaned response
+    return response.strip()
+
+
+def fix_common_sql_errors(sql: str) -> str:
+    """
+    Fix common SQL syntax errors from fine-tuned models.
+    - Remove GROUP BY/ORDER BY after LIMIT
+    - Remove duplicate LIMIT clauses
+    - Stop at first semicolon
+    """
+    import re
+    
+    # Stop at first semicolon (model sometimes continues generating)
+    if ';' in sql:
+        sql = sql.split(';')[0] + ';'
+    
+    # Fix: GROUP BY/ORDER BY after LIMIT (invalid syntax)
+    # Pattern: LIMIT <number> followed by GROUP BY or ORDER BY
+    sql = re.sub(
+        r'(LIMIT\s+\d+)\s+(GROUP\s+BY|ORDER\s+BY).*?(?=LIMIT|$)',
+        r'\1',
+        sql,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    
+    # Remove duplicate LIMIT clauses (keep only the first one)
+    limit_matches = list(re.finditer(r'LIMIT\s+\d+', sql, re.IGNORECASE))
+    if len(limit_matches) > 1:
+        # Keep everything up to and including the first LIMIT
+        first_limit_end = limit_matches[0].end()
+        sql = sql[:first_limit_end]
+        if not sql.rstrip().endswith(';'):
+            sql += ';'
+    
+    return sql.strip()
 
 
 def generate_ollama(model_name: str, prompt: str) -> str:
@@ -204,14 +425,35 @@ def generate_openrouter(model_name: str, api_key: str, prompt: str, max_tokens: 
     return response.json()['choices'][0]['message']['content']
 
 
-def create_prompt_q2sql(question: str, model_type: str, schema_context: Optional[str] = None) -> str:
+def get_minimal_schema() -> str:
+    """Return the minimal schema summary used during fine-tuning."""
+    return """- cim_vector: Building geometries, project scenarios, grid infrastructure
+- cim_census: Italian census demographic data (ISTAT 2011)
+- cim_raster: DTM/DSM raster data
+- cim_network: Electrical grid network data"""
+
+
+def create_prompt_q2sql(question: str, model_type: str, schema_context: Optional[str] = None, include_schema: bool = False, use_finetuned_schema: bool = False) -> str:
     """Create prompt for Q2SQL task."""
-    if schema_context:
-        system_msg = f"""You are an expert in PostGIS spatial SQL for City Information Modeling.
-Generate only the SQL query without explanations.
+    schema_text = ""
+    if use_finetuned_schema:
+        # Use the exact mini-schema from training
+        schema_text = get_minimal_schema()
+    elif include_schema or schema_context:
+        if schema_context:
+            schema_text = schema_context
+        else:
+            # Load full schema for context
+            schema_text = load_database_schema()
+    
+    if schema_text:
+        system_msg = f"""You are an expert in PostGIS spatial SQL for City Information Modeling (CIM).
+Your task is to generate precise PostGIS spatial SQL queries for the CIM Wizard database.
 
 Database Schema:
-{schema_context}"""
+{schema_text}
+
+Generate only the SQL query without explanations."""
     else:
         system_msg = """You are an expert in PostGIS spatial SQL for City Information Modeling.
 Generate only the SQL query without explanations."""
@@ -288,22 +530,29 @@ Generate detailed reasoning instructions for converting the question to PostGIS 
 
 
 def execute_sql(sql: str, db_uri: str, timeout: int = 30) -> Dict[str, Any]:
-    """Execute SQL and return results."""
+    """Execute SQL and return results along with metadata."""
+    start_time = time.time()
     try:
         engine = create_engine(db_uri, poolclass=NullPool, echo=False)
         with engine.connect() as conn:
             conn.execute(text(f"SET statement_timeout = {timeout * 1000};"))
             result = conn.execute(text(sql))
             rows = result.fetchall()
+            duration_ms = (time.time() - start_time) * 1000
             return {
                 'success': True,
-                'result': [tuple(row) for row in rows],
+                'result': [list(row) for row in rows],
+                'rowcount': len(rows),
+                'duration_ms': duration_ms,
                 'error': None
             }
     except Exception as e:
+        duration_ms = (time.time() - start_time) * 1000
         return {
             'success': False,
             'result': None,
+            'rowcount': 0,
+            'duration_ms': duration_ms,
             'error': str(e)
         }
 
@@ -315,14 +564,51 @@ def compute_em(generated: str, ground_truth: str) -> bool:
     return gen_clean.lower() == gt_clean.lower()
 
 
-def compute_ex(generated_sql: str, ground_truth_result: Any, db_uri: str) -> bool:
-    """Compute Execution Accuracy metric."""
-    exec_result = execute_sql(generated_sql, db_uri)
+def is_subset_match(generated_result: list, ground_truth_result: list) -> bool:
+    """
+    Check if ground truth results are a subset of generated results.
+    This allows for:
+    - Model returning more rows than ground truth (e.g., no LIMIT or higher LIMIT)
+    - Different ordering (ORDER BY variations)
     
-    if not exec_result['success']:
+    Returns True if all ground truth rows are present in generated results.
+    """
+    if not ground_truth_result:
+        # Empty ground truth matches empty or any result
+        return True
+    
+    if not generated_result:
+        # Non-empty ground truth doesn't match empty result
         return False
     
-    return exec_result['result'] == ground_truth_result
+    # Convert to sets of tuples for efficient lookup
+    # Handle nested lists by converting to tuples recursively
+    def to_hashable(row):
+        if isinstance(row, list):
+            return tuple(to_hashable(item) if isinstance(item, list) else item for item in row)
+        return row
+    
+    try:
+        ground_truth_set = {to_hashable(row) for row in ground_truth_result}
+        generated_set = {to_hashable(row) for row in generated_result}
+        
+        # Check if ground truth is subset of generated
+        return ground_truth_set.issubset(generated_set)
+    except (TypeError, ValueError):
+        # Fallback to exact match if unhashable types
+        return generated_result == ground_truth_result
+
+
+def compute_ex(execution_output: Dict[str, Any], ground_truth_result: Any) -> bool:
+    """
+    Compute Execution Accuracy metric from an execution output.
+    Uses subset matching: ground truth must be a subset of generated results.
+    """
+    if ground_truth_result is None:
+        return False
+    if not execution_output['success']:
+        return False
+    return is_subset_match(execution_output['result'], ground_truth_result)
 
 
 def compute_semantic_similarity(text1: str, text2: str, model: SentenceTransformer) -> float:
@@ -502,10 +788,17 @@ def evaluate_q2sql(
     model_dict: Dict,
     db_uri: str,
     model_type: str,
-    primary_tone: str
+    primary_tone: str,
+    artifact_file: Optional[Path] = None,
+    include_schema: bool = False,
+    use_finetuned_schema: bool = False
 ) -> Dict[str, Any]:
     """Evaluate Q2SQL mode: Question → SQL."""
     print("\nEvaluating Q2SQL mode...")
+    if use_finetuned_schema:
+        print("Schema context: FINE-TUNED MINI-SCHEMA (from training)")
+    elif include_schema:
+        print("Schema context: FULL DATABASE SCHEMA")
     
     results = []
     em_correct = 0
@@ -516,31 +809,42 @@ def evaluate_q2sql(
         ground_truth_sql = item['sql_postgis']
         ground_truth_result = item['expected_result']
         
-        prompt = create_prompt_q2sql(question, model_type)
+        prompt = create_prompt_q2sql(question, model_type, include_schema=include_schema, use_finetuned_schema=use_finetuned_schema)
         
         if model_dict['type'] == 'hf':
-            generated_sql = generate_hf(model_dict, prompt, max_tokens=512)
-        else:
-            generated_sql = generate_ollama(model_dict['model_name'], prompt)
+            raw_response = generate_hf(model_dict, prompt, max_tokens=512)
+            generated_sql = extract_sql_from_response(raw_response)
+            generated_sql = fix_common_sql_errors(generated_sql)
+        elif model_dict['type'] == 'ollama':
+            raw_response = generate_ollama(model_dict['model_name'], prompt)
+            generated_sql = extract_sql_from_response(raw_response)
+            generated_sql = fix_common_sql_errors(generated_sql)
+        elif model_dict['type'] == 'openrouter':
+            raw_response = generate_openrouter(model_dict['model_name'], model_dict['api_key'], prompt, max_tokens=512)
+            generated_sql = extract_sql_from_response(raw_response)
+            generated_sql = fix_common_sql_errors(generated_sql)
         
+        execution_output = execute_sql(generated_sql, db_uri)
         em = compute_em(generated_sql, ground_truth_sql)
-        ex = False
-        if ground_truth_result is not None:
-            ex = compute_ex(generated_sql, ground_truth_result, db_uri)
+        ex = compute_ex(execution_output, ground_truth_result)
         
         if em:
             em_correct += 1
         if ex:
             ex_correct += 1
         
-        results.append({
+        sample_record = {
             'benchmark_id': item['benchmark_id'],
             'question': question,
             'ground_truth_sql': ground_truth_sql,
+            'raw_response': raw_response,
             'generated_sql': generated_sql,
+            'execution': execution_output,
             'em': em,
             'ex': ex
-        })
+        }
+        results.append(sample_record)
+        append_artifact(artifact_file, sample_record)
     
     total = len(benchmark)
     
@@ -566,7 +870,8 @@ def evaluate_qinst2sql(
     model_dict: Dict,
     db_uri: str,
     model_type: str,
-    primary_tone: str
+    primary_tone: str,
+    artifact_file: Optional[Path] = None
 ) -> Dict[str, Any]:
     """Evaluate QInst2SQL mode: Question + Instruction → SQL."""
     print("\nEvaluating QInst2SQL mode...")
@@ -584,29 +889,40 @@ def evaluate_qinst2sql(
         prompt = create_prompt_qinst2sql(question, instruction, model_type)
         
         if model_dict['type'] == 'hf':
-            generated_sql = generate_hf(model_dict, prompt, max_tokens=512)
-        else:
-            generated_sql = generate_ollama(model_dict['model_name'], prompt)
+            raw_response = generate_hf(model_dict, prompt, max_tokens=512)
+            generated_sql = extract_sql_from_response(raw_response)
+            generated_sql = fix_common_sql_errors(generated_sql)
+        elif model_dict['type'] == 'ollama':
+            raw_response = generate_ollama(model_dict['model_name'], prompt)
+            generated_sql = extract_sql_from_response(raw_response)
+            generated_sql = fix_common_sql_errors(generated_sql)
+        elif model_dict['type'] == 'openrouter':
+            raw_response = generate_openrouter(model_dict['model_name'], model_dict['api_key'], prompt, max_tokens=512)
+            generated_sql = extract_sql_from_response(raw_response)
+            generated_sql = fix_common_sql_errors(generated_sql)
         
         em = compute_em(generated_sql, ground_truth_sql)
-        ex = False
-        if ground_truth_result is not None:
-            ex = compute_ex(generated_sql, ground_truth_result, db_uri)
+        execution_output = execute_sql(generated_sql, db_uri)
+        ex = compute_ex(execution_output, ground_truth_result)
         
         if em:
             em_correct += 1
         if ex:
             ex_correct += 1
         
-        results.append({
+        sample_record = {
             'benchmark_id': item['benchmark_id'],
             'question': question,
             'instruction': instruction,
             'ground_truth_sql': ground_truth_sql,
+            'raw_response': raw_response,
             'generated_sql': generated_sql,
+            'execution': execution_output,
             'em': em,
             'ex': ex
-        })
+        }
+        results.append(sample_record)
+        append_artifact(artifact_file, sample_record)
     
     total = len(benchmark)
     
@@ -633,7 +949,8 @@ def evaluate_q2inst(
     db_uri: str,
     model_type: str,
     downstream_model_dict: Optional[Dict] = None,
-    downstream_model_type: Optional[str] = None
+    downstream_model_type: Optional[str] = None,
+    artifact_file: Optional[Path] = None
 ) -> Dict[str, Any]:
     """Evaluate Q2Inst mode: Question → Instruction (Hybrid evaluation)."""
     print("\nEvaluating Q2Inst mode (Hybrid)...")
@@ -656,8 +973,10 @@ def evaluate_q2inst(
         
         if model_dict['type'] == 'hf':
             generated_instruction = generate_hf(model_dict, prompt, max_tokens=512)
-        else:
+        elif model_dict['type'] == 'ollama':
             generated_instruction = generate_ollama(model_dict['model_name'], prompt)
+        elif model_dict['type'] == 'openrouter':
+            generated_instruction = generate_openrouter(model_dict['model_name'], model_dict['api_key'], prompt, max_tokens=512)
         
         similarity = compute_semantic_similarity(
             generated_instruction,
@@ -668,6 +987,7 @@ def evaluate_q2inst(
         
         downstream_sql_correct = False
         generated_downstream_sql = None
+        downstream_execution = None
         
         if downstream_model_dict is not None:
             prompt_downstream = create_prompt_qinst2sql(
@@ -682,30 +1002,42 @@ def evaluate_q2inst(
                     prompt_downstream,
                     max_tokens=512
                 )
-            else:
+            elif downstream_model_dict['type'] == 'ollama':
                 generated_downstream_sql = generate_ollama(
                     downstream_model_dict['model_name'],
                     prompt_downstream
                 )
-            
-            if ground_truth_result is not None:
-                downstream_sql_correct = compute_ex(
-                    generated_downstream_sql,
-                    ground_truth_result,
-                    db_uri
+            elif downstream_model_dict['type'] == 'openrouter':
+                generated_downstream_sql = generate_openrouter(
+                    downstream_model_dict['model_name'],
+                    downstream_model_dict['api_key'],
+                    prompt_downstream,
+                    max_tokens=512
                 )
-                if downstream_sql_correct:
-                    downstream_correct += 1
+            
+            downstream_execution = execute_sql(
+                generated_downstream_sql,
+                db_uri
+            )
+            downstream_sql_correct = compute_ex(
+                downstream_execution,
+                ground_truth_result
+            )
+            if downstream_sql_correct:
+                downstream_correct += 1
         
-        results.append({
+        sample_record = {
             'benchmark_id': item['benchmark_id'],
             'question': question,
             'ground_truth_instruction': ground_truth_instruction,
             'generated_instruction': generated_instruction,
             'semantic_similarity': similarity,
             'downstream_sql': generated_downstream_sql,
+            'downstream_execution': downstream_execution,
             'downstream_sql_correct': downstream_sql_correct
-        })
+        }
+        results.append(sample_record)
+        append_artifact(artifact_file, sample_record)
     
     total = len(benchmark)
     avg_similarity = sum(similarities) / len(similarities) if similarities else 0
@@ -753,7 +1085,7 @@ def save_results(evaluation_results: Dict[str, Any], output_file: Path):
     print(f"\nSaving results to: {output_file}")
     
     with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(evaluation_results, f, indent=2, ensure_ascii=False)
+        json.dump(evaluation_results, f, indent=2, ensure_ascii=False, default=json_serializer)
     
     print(f"Results saved")
 
@@ -764,7 +1096,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
-    parser.add_argument('--benchmark', type=Path, required=True,
+    parser.add_argument('--benchmark', type=str, required=True,
                        help='FTv2 benchmark JSONL file')
     parser.add_argument('--model', type=str, required=True,
                        help='Model spec (hf:model_name or ollama:model_name)')
@@ -782,31 +1114,74 @@ def main():
     parser.add_argument('--db_uri', type=str,
                        default="postgresql://cim_wizard_user:cim_wizard_password@localhost:15432/cim_wizard_integrated",
                        help='Database URI')
-    parser.add_argument('--output', type=Path,
+    parser.add_argument('--output', type=str,
                        help='Output file for results (default: auto-generated)')
     parser.add_argument('--primary_tone', type=str,
                        default='INTERROGATIVE',
                        help='Primary question tone for robustness analysis (default: INTERROGATIVE)')
+    parser.add_argument('--artifacts_dir', type=str,
+                       default='ftv2_model_artifacts',
+                       help='Directory for per-sample SQL/results artifacts')
+    parser.add_argument('--no_artifacts', action='store_true',
+                       help='Disable saving per-sample artifacts')
+    parser.add_argument('--include_schema', action='store_true',
+                       help='Include full database schema in prompts (for non-fine-tuned/frontier models)')
+    parser.add_argument('--use_finetuned_schema', action='store_true',
+                       help='Use the mini-schema from fine-tuning (for FTv2/FTv3 fine-tuned models)')
+    parser.add_argument('--openrouter_api_key', type=str,
+                       help='OpenRouter API key (can also use OPENROUTER_API_KEY env var)')
     
     args = parser.parse_args()
     
-    if not args.benchmark.exists():
-        print(f"Error: Benchmark file not found: {args.benchmark}")
-        sys.exit(1)
+    # If using OpenRouter and no API key provided, try to load from environment
+    if args.model.startswith('openrouter:') and not args.openrouter_api_key:
+        args.openrouter_api_key = os.getenv('OPENROUTER_API_KEY')
+        if args.openrouter_api_key:
+            print("[env] Loaded OPENROUTER_API_KEY from environment")
     
-    benchmark = load_benchmark(args.benchmark)
+    benchmark_path = resolve_cli_path(
+        args.benchmark,
+        ensure_exists=True,
+        description='Benchmark file'
+    )
+    benchmark = load_benchmark(benchmark_path)
     
-    model_dict = load_model(args.model)
+    model_dict = load_model(args.model, args.openrouter_api_key)
     
     downstream_model_dict = None
     if args.mode == 'Q2Inst' and args.downstream_model:
         print("\nLoading downstream model for Q2Inst evaluation...")
-        downstream_model_dict = load_model(args.downstream_model)
+        downstream_model_dict = load_model(args.downstream_model, args.openrouter_api_key)
+    
+    artifact_file = None
+    if not args.no_artifacts:
+        artifact_base = resolve_cli_path(
+            args.artifacts_dir,
+            ensure_exists=False,
+            description='Artifacts directory'
+        )
+        artifact_file = prepare_artifact_file(artifact_base, args.mode, args.model)
     
     if args.mode == 'Q2SQL':
-        results = evaluate_q2sql(benchmark, model_dict, args.db_uri, args.model_type, args.primary_tone)
+        results = evaluate_q2sql(
+            benchmark,
+            model_dict,
+            args.db_uri,
+            args.model_type,
+            args.primary_tone,
+            artifact_file,
+            args.include_schema,
+            args.use_finetuned_schema
+        )
     elif args.mode == 'QInst2SQL':
-        results = evaluate_qinst2sql(benchmark, model_dict, args.db_uri, args.model_type, args.primary_tone)
+        results = evaluate_qinst2sql(
+            benchmark,
+            model_dict,
+            args.db_uri,
+            args.model_type,
+            args.primary_tone,
+            artifact_file
+        )
     elif args.mode == 'Q2Inst':
         results = evaluate_q2inst(
             benchmark,
@@ -814,15 +1189,20 @@ def main():
             args.db_uri,
             args.model_type,
             downstream_model_dict,
-            args.downstream_model_type
+            args.downstream_model_type,
+            artifact_file
         )
     
     results['evaluation_timestamp'] = datetime.now().isoformat()
     results['model'] = args.model
-    results['benchmark_file'] = str(args.benchmark)
+    results['benchmark_file'] = str(benchmark_path)
     
     if args.output:
-        output_file = args.output
+        output_file = resolve_cli_path(
+            args.output,
+            ensure_exists=False,
+            description='Output file'
+        )
     else:
         mode_lower = args.mode.lower()
         model_name = args.model.split('/')[-1].replace(':', '_')
