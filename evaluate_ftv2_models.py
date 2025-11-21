@@ -599,6 +599,86 @@ def is_subset_match(generated_result: list, ground_truth_result: list) -> bool:
         return generated_result == ground_truth_result
 
 
+def calculate_deep_em(generated_sql: str, benchmark_item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Calculate deep Exact Match by comparing SQL structural features.
+    
+    Compares:
+    - Spatial functions used
+    - Spatial function count
+    - Function count
+    - Join count
+    - Table count
+    
+    Returns dict with individual scores and overall deep_EM score.
+    """
+    import re
+    
+    # Extract features from generated SQL
+    gen_spatial_funcs = re.findall(r'ST_\w+', generated_sql, re.IGNORECASE)
+    gen_spatial_func_count = len(gen_spatial_funcs)
+    
+    # Extract tables
+    gen_tables = []
+    from_matches = re.findall(r'FROM\s+(\w+\.\w+|\w+)', generated_sql, re.IGNORECASE)
+    gen_tables.extend(from_matches)
+    join_matches = re.findall(r'JOIN\s+(\w+\.\w+|\w+)', generated_sql, re.IGNORECASE)
+    gen_tables.extend(join_matches)
+    gen_table_count = len(set(gen_tables))
+    
+    # Count joins
+    gen_join_count = generated_sql.upper().count('JOIN')
+    
+    # Get ground truth values
+    gt_spatial_funcs = set(benchmark_item.get('spatial_functions', []))
+    gt_spatial_func_count = benchmark_item.get('spatial_function_count', 0)
+    gt_function_count = benchmark_item.get('function_count', '0')
+    gt_join_count = benchmark_item.get('join_count', '0')
+    gt_table_count = benchmark_item.get('table_count', 0)
+    
+    # Convert join_count to int for comparison
+    try:
+        gt_join_count_int = int(gt_join_count.replace('+', ''))
+    except:
+        gt_join_count_int = 0
+    
+    # Calculate individual scores
+    scores = {}
+    
+    # Spatial functions match (set comparison)
+    gen_spatial_funcs_set = set(f.upper() for f in gen_spatial_funcs)
+    gt_spatial_funcs_upper = set(f.upper() for f in gt_spatial_funcs)
+    scores['spatial_functions_match'] = gen_spatial_funcs_set == gt_spatial_funcs_upper
+    
+    # Spatial function count match (exact or close)
+    scores['spatial_func_count_match'] = abs(gen_spatial_func_count - gt_spatial_func_count) <= 1
+    
+    # Join count match
+    if '+' in str(gt_join_count):
+        scores['join_count_match'] = gen_join_count >= gt_join_count_int
+    else:
+        scores['join_count_match'] = abs(gen_join_count - gt_join_count_int) <= 1
+    
+    # Table count match
+    scores['table_count_match'] = abs(gen_table_count - gt_table_count) <= 1
+    
+    # Calculate overall deep_EM score (average of individual scores)
+    score_values = [1.0 if v else 0.0 for v in scores.values()]
+    overall_score = sum(score_values) / len(score_values) if score_values else 0.0
+    
+    return {
+        'deep_em_score': overall_score,
+        'deep_em_pass': overall_score >= 0.75,  # Pass if 75% of features match
+        'spatial_functions_match': scores['spatial_functions_match'],
+        'spatial_func_count_match': scores['spatial_func_count_match'],
+        'join_count_match': scores['join_count_match'],
+        'table_count_match': scores['table_count_match'],
+        'generated_spatial_funcs': list(gen_spatial_funcs_set),
+        'generated_table_count': gen_table_count,
+        'generated_join_count': gen_join_count
+    }
+
+
 def compute_ex(execution_output: Dict[str, Any], ground_truth_result: Any) -> bool:
     """
     Compute Execution Accuracy metric from an execution output.
@@ -803,6 +883,7 @@ def evaluate_q2sql(
     results = []
     em_correct = 0
     ex_correct = 0
+    deep_em_correct = 0
     
     for item in tqdm(benchmark, desc="Evaluating"):
         question = item['question']
@@ -827,11 +908,14 @@ def evaluate_q2sql(
         execution_output = execute_sql(generated_sql, db_uri)
         em = compute_em(generated_sql, ground_truth_sql)
         ex = compute_ex(execution_output, ground_truth_result)
+        deep_em_result = calculate_deep_em(generated_sql, item)
         
         if em:
             em_correct += 1
         if ex:
             ex_correct += 1
+        if deep_em_result['deep_em_pass']:
+            deep_em_correct += 1
         
         sample_record = {
             'benchmark_id': item['benchmark_id'],
@@ -841,7 +925,8 @@ def evaluate_q2sql(
             'generated_sql': generated_sql,
             'execution': execution_output,
             'em': em,
-            'ex': ex
+            'ex': ex,
+            'deep_em': deep_em_result
         }
         results.append(sample_record)
         append_artifact(artifact_file, sample_record)
@@ -852,13 +937,19 @@ def evaluate_q2sql(
     breakdowns = calculate_performance_breakdowns(results, benchmark)
     tone_robustness = compute_tone_robustness(breakdowns, primary_tone)
     
+    # Calculate average deep_EM score
+    avg_deep_em_score = sum(r['deep_em']['deep_em_score'] for r in results) / total if total > 0 else 0
+    
     return {
         'mode': 'Q2SQL',
         'total_samples': total,
         'em_correct': em_correct,
         'ex_correct': ex_correct,
+        'deep_em_correct': deep_em_correct,
         'em_accuracy': em_correct / total if total > 0 else 0,
         'ex_accuracy': ex_correct / total if total > 0 else 0,
+        'deep_em_accuracy': deep_em_correct / total if total > 0 else 0,
+        'average_deep_em_score': avg_deep_em_score,
         'tone_robustness': tone_robustness,
         'performance_breakdowns': breakdowns,
         'results': results
@@ -1219,6 +1310,8 @@ def main():
         print(f"  Total samples: {results['total_samples']}")
         print(f"  EM accuracy: {results['em_accuracy']*100:.2f}%")
         print(f"  EX accuracy: {results['ex_accuracy']*100:.2f}%")
+        print(f"  Deep EM accuracy: {results['deep_em_accuracy']*100:.2f}%")
+        print(f"  Avg deep EM score: {results['average_deep_em_score']:.3f}")
         if results.get('tone_robustness'):
             rb = results['tone_robustness']
             print(f"  Tone robustness (EX): primary {rb['primary_ex_accuracy']*100:.1f}%, "
