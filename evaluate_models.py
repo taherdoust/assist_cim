@@ -595,7 +595,7 @@ def is_subset_match(generated_result: list, ground_truth_result: list) -> bool:
         try:
             # Try comparing first few rows
             if len(generated_result) <= 3 and len(ground_truth_result) <= 3:
-                return generated_result == ground_truth_result
+        return generated_result == ground_truth_result
         except:
             pass
         return False

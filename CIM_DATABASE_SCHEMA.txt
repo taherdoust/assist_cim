@@ -9,7 +9,7 @@ Building footprints and identification
 - census_id BIGINT - Link to census zone (SEZ2011)
 - lod INTEGER - Level of detail (0=footprint, 1=with height, 2=detailed)
 
-### cim_vector.cim_wizard_building_properties
+### cim_vector.cim_wizard_building_properties  
 Building characteristics and energy properties
 - building_id VARCHAR(100) - Links to cim_wizard_building
 - project_id VARCHAR(100), scenario_id VARCHAR(100) - Project context
@@ -38,14 +38,14 @@ Italian census data (ISTAT 2011)
 - e8-e16 INTEGER - Building age distribution (e8=pre-1918, e16=post-2005)
 - pf1 INTEGER - Total families
 
-### cim_vector.network_buses
+### cim_network.network_buses
 Electrical grid nodes
 - bus_id INTEGER, network_id VARCHAR(100)
 - project_id VARCHAR(100), scenario_id VARCHAR(100)
 - bus_geometry GEOMETRY(POINT, 4326)
 - voltage_kv FLOAT - Operating voltage
 
-### cim_vector.network_lines
+### cim_network.network_lines
 Electrical transmission lines
 - line_id INTEGER, network_id VARCHAR(100)
 - project_id VARCHAR(100), scenario_id VARCHAR(100)

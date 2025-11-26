@@ -130,13 +130,25 @@ DOMAIN_TAXONOMY = {
 }
 
 # ============================================================================
-# QUESTION TONES
+# QUESTION TONES (including negative sample tones)
 # ============================================================================
 
 QUESTION_TONES = {
     "INTERROGATIVE": 0.70,
     "DIRECT": 0.20,
-    "DESCRIPTIVE": 0.10
+    "DESCRIPTIVE": 0.10,
+    "AMBIGUOUS": 0.0,
+    "OUT_OF_SCOPE": 0.0
+}
+
+# ============================================================================
+# SAMPLE DIRTINESS (data quality classification)
+# ============================================================================
+
+SAMPLE_DIRTINESS = {
+    "CLEAN": "Valid positive samples with correct SQL",
+    "AMBIGUOUS": "Negative samples with missing context or invalid schema references",
+    "OUT_OF_SCOPE": "Negative samples completely irrelevant to CIM database"
 }
 
 # ============================================================================
@@ -464,25 +476,66 @@ def classify_question_tone(question: str) -> str:
     return "DESCRIPTIVE"
 
 
-def classify_sample(sql: str, question: str) -> Dict[str, Any]:
+def classify_sample(sql: str, question: str, original_sample: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Classify a sample with full taxonomy information.
-    Returns classification dictionary with task, domain, and question tone.
+    Returns classification dictionary with task, domain, question tone, and sample dirtiness.
+    If original_sample is provided, uses its taxonomy fields if available.
     """
-    task_type, task_meta = classify_task_type(sql)
-    domain_type, domain_meta = classify_domain_type(sql)
-    question_tone = classify_question_tone(question)
+    # Use original sample's taxonomy if available
+    if original_sample:
+        if 'task_type' in original_sample:
+            task_type = original_sample['task_type']
+            task_complexity = original_sample.get('task_complexity', 1)
+            task_frequency = original_sample.get('task_frequency', 1)
+            task_description = TASK_TAXONOMY.get(task_type, {}).get('description', '')
+        else:
+            task_type, task_meta = classify_task_type(sql)
+            task_complexity = task_meta["complexity"]
+            task_frequency = task_meta["frequency"]
+            task_description = task_meta["description"]
+        
+        if 'domain_type' in original_sample:
+            domain_type = original_sample['domain_type']
+            domain_complexity = original_sample.get('domain_complexity', 1)
+            domain_frequency = original_sample.get('domain_frequency', 1)
+            domain_description = DOMAIN_TAXONOMY.get(domain_type, {}).get('description', '')
+        else:
+            domain_type, domain_meta = classify_domain_type(sql)
+            domain_complexity = domain_meta["complexity"]
+            domain_frequency = domain_meta["frequency"]
+            domain_description = domain_meta["description"]
+        
+        # Use original question_tone if available (includes AMBIGUOUS, OUT_OF_SCOPE)
+        question_tone = original_sample.get('question_tone', classify_question_tone(question))
+        
+        # Use original sample_dirtiness if available
+        sample_dirtiness = original_sample.get('sample_dirtiness', 'CLEAN')
+    else:
+        task_type, task_meta = classify_task_type(sql)
+        task_complexity = task_meta["complexity"]
+        task_frequency = task_meta["frequency"]
+        task_description = task_meta["description"]
+        
+        domain_type, domain_meta = classify_domain_type(sql)
+        domain_complexity = domain_meta["complexity"]
+        domain_frequency = domain_meta["frequency"]
+        domain_description = domain_meta["description"]
+        
+        question_tone = classify_question_tone(question)
+        sample_dirtiness = 'CLEAN'
     
     return {
         "task_type": task_type,
-        "task_complexity": task_meta["complexity"],
-        "task_frequency": task_meta["frequency"],
-        "task_description": task_meta["description"],
+        "task_complexity": task_complexity,
+        "task_frequency": task_frequency,
+        "task_description": task_description,
         "domain_type": domain_type,
-        "domain_complexity": domain_meta["complexity"],
-        "domain_frequency": domain_meta["frequency"],
-        "domain_description": domain_meta["description"],
-        "question_tone": question_tone
+        "domain_complexity": domain_complexity,
+        "domain_frequency": domain_frequency,
+        "domain_description": domain_description,
+        "question_tone": question_tone,
+        "sample_dirtiness": sample_dirtiness
     }
 
 
@@ -1092,6 +1145,7 @@ class TaxonomyMetrics:
         self.domain_complexity_metrics = defaultdict(lambda: {'total': 0, 'ex': 0, 'ea': 0, 'deep_em': 0, 'sc': 0})
         self.domain_frequency_metrics = defaultdict(lambda: {'total': 0, 'ex': 0, 'ea': 0, 'deep_em': 0, 'sc': 0})
         self.question_tone_metrics = defaultdict(lambda: {'total': 0, 'ex': 0, 'ea': 0, 'deep_em': 0, 'sc': 0})
+        self.sample_dirtiness_metrics = defaultdict(lambda: {'total': 0, 'ex': 0, 'ea': 0, 'deep_em': 0, 'sc': 0})
     
     def add_sample(self, classification: Dict[str, Any], ex: bool, ea: bool, deep_em: bool, sc: bool):
         """Add a sample's metrics to all relevant categories."""
@@ -1150,6 +1204,14 @@ class TaxonomyMetrics:
         self.question_tone_metrics[question_tone]['ea'] += int(ea)
         self.question_tone_metrics[question_tone]['deep_em'] += int(deep_em)
         self.question_tone_metrics[question_tone]['sc'] += int(sc)
+        
+        # Sample dirtiness
+        sample_dirtiness = classification.get('sample_dirtiness', 'CLEAN')
+        self.sample_dirtiness_metrics[sample_dirtiness]['total'] += 1
+        self.sample_dirtiness_metrics[sample_dirtiness]['ex'] += int(ex)
+        self.sample_dirtiness_metrics[sample_dirtiness]['ea'] += int(ea)
+        self.sample_dirtiness_metrics[sample_dirtiness]['deep_em'] += int(deep_em)
+        self.sample_dirtiness_metrics[sample_dirtiness]['sc'] += int(sc)
     
     def _compute_rates(self, metrics_dict: Dict) -> Dict:
         """Compute rates from counts."""
@@ -1203,7 +1265,8 @@ class TaxonomyMetrics:
             'by_task_frequency': task_frequency,
             'by_domain_complexity': domain_complexity,
             'by_domain_frequency': domain_frequency,
-            'by_question_tone': self._compute_rates(self.question_tone_metrics)
+            'by_question_tone': self._compute_rates(self.question_tone_metrics),
+            'by_sample_dirtiness': self._compute_rates(self.sample_dirtiness_metrics)
         }
 
 
@@ -1245,8 +1308,8 @@ def evaluate_ea_q2sql_v2(
         ground_truth_sql = item['sql_postgis']
         ground_truth_result = item['expected_result']
         
-        # Classify sample
-        classification = classify_sample(ground_truth_sql, question)
+        # Classify sample (pass original item to preserve question_tone and sample_dirtiness)
+        classification = classify_sample(ground_truth_sql, question, item)
         
         # Initialize agent state
         initial_state = {
@@ -1495,6 +1558,9 @@ def generate_report(results: Dict[str, Any], model_name: str) -> str:
     
     # By Question Tone
     lines.extend(format_taxonomy_table("BY QUESTION TONE", taxonomy['by_question_tone']))
+    
+    # By Sample Dirtiness
+    lines.extend(format_taxonomy_table("BY SAMPLE DIRTINESS", taxonomy.get('by_sample_dirtiness', {})))
     
     # Key Insights
     lines.append("\n" + "=" * 80)
