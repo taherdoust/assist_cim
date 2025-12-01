@@ -308,10 +308,18 @@ def load_database_schema() -> str:
 
 def get_minimal_schema() -> str:
     """Return the minimal schema summary used during fine-tuning."""
-    return """- cim_vector: Building geometries, project scenarios, grid infrastructure
+    return """- cim_vector: Building geometries, project scenarios, Building properties
+  Tables: cim_vector.cim_wizard_building, cim_vector.cim_wizard_building_properties, 
+          cim_vector.cim_wizard_project_scenario
 - cim_census: Italian census demographic data (ISTAT 2011)
+  Tables: cim_census.censusgeo
 - cim_raster: DTM/DSM raster data
-- cim_network: Electrical grid network data"""
+  Tables: cim_raster.dtm, cim_raster.dsm_sansalva
+- cim_network: Electrical grid network data
+  Tables: cim_network.network_buses, cim_network.network_lines, cim_network.network_scenarios, cim_network.scenario_buses, cim_network.scenario_lines
+
+IMPORTANT: Always use full schema.table notation (e.g., cim_vector.cim_wizard_building).
+Never use table names without schema prefixes."""
 
 
 def load_benchmark(benchmark_file: Path) -> List[Dict[str, Any]]:
@@ -608,27 +616,55 @@ def generate_ollama(model_name: str, prompt: str) -> str:
     return response.json()['response']
 
 
-def generate_openrouter(model_name: str, api_key: str, prompt: str, max_tokens: int = 512) -> str:
-    """Generate response from OpenRouter API model."""
-    response = requests.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        headers={
-            'Authorization': f'Bearer {api_key}',
-            'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://github.com/taherdoust/coesi',
-            'X-Title': 'CIM Wizard EA Evaluation v2'
-        },
-        json={
-            'model': model_name,
-            'messages': [{'role': 'user', 'content': prompt}],
-            'max_tokens': max_tokens,
-            'temperature': 0.1
-        },
-        timeout=60
-    )
-    if response.status_code != 200:
-        raise Exception(f"OpenRouter API error: {response.status_code} - {response.text}")
-    return response.json()['choices'][0]['message']['content']
+def generate_openrouter(model_name: str, api_key: str, prompt: str, max_tokens: int = 512, max_retries: int = 3) -> str:
+    """Generate response from OpenRouter API model with retry logic."""
+    import time
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                'https://openrouter.ai/api/v1/chat/completions',
+                headers={
+                    'Authorization': f'Bearer {api_key}',
+                    'Content-Type': 'application/json',
+                    'HTTP-Referer': 'https://github.com/taherdoust/coesi',
+                    'X-Title': 'CIM Wizard EA Evaluation v2'
+                },
+                json={
+                    'model': model_name,
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'max_tokens': max_tokens,
+                    'temperature': 0.1
+                },
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                return response.json()['choices'][0]['message']['content']
+            elif response.status_code in [429, 500, 502, 503, 504]:  # Retryable errors
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 2  # Exponential backoff: 2s, 4s, 8s
+                    print(f"  ⚠ API error {response.status_code}, retrying in {wait_time}s... (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+            else:
+                raise Exception(f"OpenRouter API error: {response.status_code} - {response.text}")
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 2
+                print(f"  ⚠ Timeout, retrying in {wait_time}s... (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            raise Exception(f"OpenRouter API timeout after {max_retries} attempts")
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 2
+                print(f"  ⚠ Request error: {e}, retrying in {wait_time}s... (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            raise
+    
+    raise Exception(f"OpenRouter API failed after {max_retries} attempts: {response.status_code} - {response.text}")
 
 
 # ============================================================================
@@ -755,6 +791,17 @@ Generate only the SQL query without explanations."""
 {question}<|im_end|>
 <|im_start|>assistant
 """
+    elif model_type == 'sqlcoder':
+        # SQLCoder format (matches fine-tuning)
+        return f"""### Task
+Generate a SQL query to answer the following question:
+`{question}`
+
+### Database Schema
+{system_msg}
+
+### SQL
+"""
     elif model_type == 'llama':
         return f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
@@ -804,6 +851,26 @@ Error:
 
 Please provide the corrected SQL query.<|im_end|>
 <|im_start|>assistant
+"""
+    elif model_type == 'sqlcoder':
+        # SQLCoder format (matches fine-tuning)
+        if not schema_text:
+            schema_text = get_minimal_schema()
+        return f"""### Task
+Fix the SQL query that failed with an error.
+
+Question: {question}
+
+Previous SQL (FAILED):
+{failed_sql}
+
+Error:
+{error_msg}
+
+### Database Schema
+{schema_text}
+
+### SQL
 """
     elif model_type == 'llama':
         return f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
@@ -1271,6 +1338,150 @@ class TaxonomyMetrics:
 
 
 # ============================================================================
+# RESUME CAPABILITY
+# ============================================================================
+
+def load_existing_artifacts(artifact_file: Optional[Path], model_spec: Optional[str] = None) -> Tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Load existing artifacts to resume evaluation.
+    Searches for files matching the model name pattern (ignoring timestamp).
+    Returns: (completed_samples_dict, completed_results_list)
+    """
+    completed_samples = {}
+    completed_results = []
+    
+    if artifact_file:
+        artifact_dir = artifact_file.parent
+        
+        # Generate model name pattern from model_spec (preferred method)
+        if artifact_file.exists():
+            # Use exact file if it exists
+            artifact_path = artifact_file
+        elif artifact_dir.exists():
+            # First, try using model_spec to generate pattern
+            if model_spec:
+                safe_model_name = sanitize_model_name(model_spec)
+                model_name_pattern = safe_model_name + '_*.jsonl'
+                matching_files = list(artifact_dir.glob(model_name_pattern))
+                if matching_files:
+                    artifact_path = max(matching_files, key=lambda p: p.stat().st_mtime)
+                    print(f"\nFound existing artifacts (using model name pattern): {artifact_path.name}")
+                else:
+                    # Try case-insensitive search
+                    all_jsonl = list(artifact_dir.glob('*.jsonl'))
+                    safe_model_lower = safe_model_name.lower()
+                    matching_files = [f for f in all_jsonl if safe_model_lower in f.stem.lower()]
+                    if matching_files:
+                        artifact_path = max(matching_files, key=lambda p: p.stat().st_mtime)
+                        print(f"\nFound existing artifacts (case-insensitive match): {artifact_path.name}")
+                    else:
+                        # Try keyword-based search
+                        keywords = [k for k in model_spec.replace(':', '_').replace('/', '_').split('_') if k]
+                        matching_files = [
+                            f for f in all_jsonl 
+                            if any(kw.lower() in f.stem.lower() for kw in keywords if len(kw) > 2)
+                        ]
+                        if matching_files:
+                            artifact_path = max(matching_files, key=lambda p: p.stat().st_mtime)
+                            print(f"\nFound existing artifacts (keyword match): {artifact_path.name}")
+                        else:
+                            artifact_path = None
+            else:
+                # Fallback: extract from artifact_file name
+                artifact_stem = artifact_file.stem
+                parts = artifact_stem.split('_')
+                # Try matching first N-2 parts (assuming last parts are timestamp)
+                if len(parts) >= 2:
+                    model_name_pattern = '_'.join(parts[:-2]) + '_*.jsonl' if len(parts) > 2 else parts[0] + '_*.jsonl'
+                    matching_files = list(artifact_dir.glob(model_name_pattern))
+                    if matching_files:
+                        artifact_path = max(matching_files, key=lambda p: p.stat().st_mtime)
+                        print(f"\nFound existing artifacts (extracted pattern): {artifact_path.name}")
+                    else:
+                        artifact_path = None
+                else:
+                    artifact_path = None
+        else:
+            artifact_path = None
+        
+        if artifact_path and artifact_path.exists():
+            print(f"\nLoading existing artifacts: {artifact_path.name}")
+            print("  Loading completed samples...")
+            
+            with open(artifact_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            sample = json.loads(line)
+                            benchmark_id = sample.get('benchmark_id')
+                            if benchmark_id:
+                                completed_samples[benchmark_id] = sample
+                                completed_results.append(sample)
+                        except json.JSONDecodeError:
+                            continue
+            
+            print(f"  Loaded {len(completed_samples)} completed samples")
+    
+    return completed_samples, completed_results
+
+
+def save_partial_results(
+    results: List[Dict[str, Any]],
+    taxonomy_metrics: 'TaxonomyMetrics',
+    total_samples: int,
+    completed_count: int,
+    fs_correct: int,
+    ea_correct: int,
+    deep_em_correct: int,
+    sc_correct: int,
+    total_iterations: int,
+    self_corrections: int,
+    max_iterations: int,
+    output_file: Path
+) -> None:
+    """Save partial results when evaluation is interrupted."""
+    total = completed_count
+    avg_iterations = total_iterations / total if total > 0 else 0
+    fs_accuracy = fs_correct / total if total > 0 else 0
+    ea_accuracy = ea_correct / total if total > 0 else 0
+    deep_em_accuracy = deep_em_correct / total if total > 0 else 0
+    sc_accuracy = sc_correct / total if total > 0 else 0
+    sc_rate = self_corrections / (total - fs_correct) if (total - fs_correct) > 0 else 0
+    avg_ea_score = sum(r['ea_score'] for r in results) / total if total > 0 else 0
+    avg_deep_em_score = sum(r['deep_em']['deep_em_score'] for r in results) / total if total > 0 else 0
+    
+    partial_results = {
+        'mode': 'Q2SQL_EA_v2',
+        'max_iterations': max_iterations,
+        'partial': True,
+        'completed_samples': completed_count,
+        'total_samples': total_samples,
+        'overall': {
+            'total_samples': total,
+            'first_shot_correct': fs_correct,
+            'eventual_correct': ea_correct,
+            'deep_em_correct': deep_em_correct,
+            'semantic_correct': sc_correct,
+            'self_corrections': self_corrections,
+            'ex_accuracy': fs_accuracy,
+            'ea_accuracy': ea_accuracy,
+            'deep_em_accuracy': deep_em_accuracy,
+            'semantic_correctness': sc_accuracy,
+            'self_correction_rate': sc_rate,
+            'average_iterations': avg_iterations,
+            'average_ea_score': avg_ea_score,
+            'average_deep_em_score': avg_deep_em_score
+        },
+        'taxonomy_metrics': taxonomy_metrics.get_summary(),
+        'results': results
+    }
+    
+    partial_output = output_file.parent / f"partial_{output_file.name}"
+    save_results(partial_results, partial_output)
+    print(f"\n  ⚠ Partial results saved to: {partial_output}")
+
+
+# ============================================================================
 # MAIN EVALUATION FUNCTION
 # ============================================================================
 
@@ -1282,9 +1493,11 @@ def evaluate_ea_q2sql_v2(
     max_iterations: int,
     include_schema: bool,
     use_finetuned_schema: bool,
-    artifact_file: Optional[Path] = None
+    artifact_file: Optional[Path] = None,
+    output_file: Optional[Path] = None,
+    model_spec: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Evaluate Q2SQL with EA and taxonomy-based metrics."""
+    """Evaluate Q2SQL with EA and taxonomy-based metrics with resume capability."""
     print("\nEvaluating Q2SQL with EA (Eventual Accuracy) and Taxonomy Analysis...")
     print(f"Max iterations: {max_iterations}")
     if use_finetuned_schema:
@@ -1292,18 +1505,49 @@ def evaluate_ea_q2sql_v2(
     elif include_schema:
         print("Schema context: FULL DATABASE SCHEMA")
     
+    # Extract model_spec from model_dict if not provided
+    if not model_spec:
+        if model_dict.get('type') == 'openrouter':
+            model_spec = f"openrouter:{model_dict.get('model_name', '')}"
+        elif model_dict.get('type') == 'hf':
+            model_spec = f"hf:{model_dict.get('model_name', '')}"
+        elif model_dict.get('type') == 'ollama':
+            model_spec = f"ollama:{model_dict.get('model_name', '')}"
+    
+    # Load existing artifacts for resume capability
+    completed_samples, completed_results = load_existing_artifacts(artifact_file, model_spec=model_spec)
+    
     agent = build_agent_graph()
     taxonomy_metrics = TaxonomyMetrics()
     
-    results = []
-    fs_correct = 0  # First-shot correct (EX)
-    ea_correct = 0  # Eventually correct (EA)
-    deep_em_correct = 0  # Deep EM correct
-    sc_correct = 0  # Semantic correctness
-    total_iterations = 0
-    self_corrections = 0
+    # Initialize with completed results
+    results = completed_results.copy()
+    fs_correct = sum(1 for r in completed_results if r.get('first_shot_success', False))
+    ea_correct = sum(1 for r in completed_results if r.get('eventual_success', False))
+    deep_em_correct = sum(1 for r in completed_results if r.get('deep_em', {}).get('deep_em_pass', False))
+    sc_correct = sum(1 for r in completed_results if calculate_semantic_correctness(r))
+    total_iterations = sum(r.get('iterations_used', 0) for r in completed_results)
+    self_corrections = sum(1 for r in completed_results if r.get('iterations_used', 0) > 1 and r.get('eventual_success', False))
     
-    for item in tqdm(benchmark, desc="Evaluating EA with Taxonomy"):
+    # Rebuild taxonomy metrics from completed results
+    for sample_record in completed_results:
+        classification = sample_record.get('classification', {})
+        if classification:
+            taxonomy_metrics.add_sample(
+                classification,
+                ex=sample_record.get('first_shot_success', False),
+                ea=sample_record.get('eventual_success', False),
+                deep_em=sample_record.get('deep_em', {}).get('deep_em_pass', False),
+                sc=calculate_semantic_correctness(sample_record)
+            )
+    
+    # Filter benchmark to only include incomplete samples
+    remaining_benchmark = [item for item in benchmark if item['benchmark_id'] not in completed_samples]
+    
+    if len(completed_samples) > 0:
+        print(f"\nResuming evaluation: {len(completed_samples)} completed, {len(remaining_benchmark)} remaining")
+    
+    for item in tqdm(remaining_benchmark, desc="Evaluating EA with Taxonomy", initial=len(completed_samples), total=len(benchmark)):
         question = item['question']
         ground_truth_sql = item['sql_postgis']
         ground_truth_result = item['expected_result']
@@ -1329,8 +1573,23 @@ def evaluate_ea_q2sql_v2(
             'use_finetuned_schema': use_finetuned_schema
         }
         
-        # Run agent
-        final_state = agent.invoke(initial_state)
+        # Run agent with error handling
+        try:
+            final_state = agent.invoke(initial_state)
+        except Exception as e:
+            print(f"\n⚠ Error processing benchmark_id {item['benchmark_id']}: {e}")
+            print(f"  Saving partial results and stopping...")
+            
+            # Save partial results immediately
+            if output_file:
+                save_partial_results(
+                    results, taxonomy_metrics, len(benchmark), len(results),
+                    fs_correct, ea_correct, deep_em_correct, sc_correct,
+                    total_iterations, self_corrections, max_iterations, output_file
+                )
+            
+            # Re-raise to stop evaluation
+            raise
         
         # Extract results
         final_sql = final_state['current_sql']
@@ -1615,7 +1874,7 @@ def main():
                        choices=['Q2SQL'],
                        help='Evaluation mode (currently only Q2SQL supported)')
     parser.add_argument('--model_type', type=str, default='qwen',
-                       choices=['qwen', 'llama', 'plain'],
+                       choices=['qwen', 'llama', 'plain', 'sqlcoder'],
                        help='Model type for prompt formatting (default: qwen)')
     parser.add_argument('--max_iterations', type=int, default=5,
                        help='Maximum correction iterations (default: 5)')
@@ -1656,22 +1915,7 @@ def main():
         artifact_base = resolve_cli_path(args.artifacts_dir, ensure_exists=False, description='Artifacts directory')
         artifact_file = prepare_artifact_file(artifact_base, f"{args.mode}_EA_v2", args.model)
     
-    results = evaluate_ea_q2sql_v2(
-        benchmark,
-        model_dict,
-        args.db_uri,
-        args.model_type,
-        args.max_iterations,
-        args.include_schema,
-        args.use_finetuned_schema,
-        artifact_file
-    )
-    
-    results['evaluation_timestamp'] = datetime.now().isoformat()
-    results['model'] = args.model
-    results['benchmark_file'] = str(benchmark_path)
-    
-    # Generate output filenames
+    # Generate output filenames (before evaluation for partial save capability)
     mode_lower = args.mode.lower()
     model_name = args.model.split('/')[-1].replace(':', '_')
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1680,6 +1924,23 @@ def main():
         output_file = resolve_cli_path(args.output, ensure_exists=False, description='Output file')
     else:
         output_file = Path(f'ea_v2_results_{mode_lower}_{model_name}_{timestamp}.json')
+    
+    results = evaluate_ea_q2sql_v2(
+        benchmark,
+        model_dict,
+        args.db_uri,
+        args.model_type,
+        args.max_iterations,
+        args.include_schema,
+        args.use_finetuned_schema,
+        artifact_file,
+        output_file,
+        model_spec=args.model
+    )
+    
+    results['evaluation_timestamp'] = datetime.now().isoformat()
+    results['model'] = args.model
+    results['benchmark_file'] = str(benchmark_path)
     
     save_results(results, output_file)
     
