@@ -48,12 +48,19 @@ from datetime import datetime
 from collections import defaultdict
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 import numpy as np
 from tqdm import tqdm
 import requests
+
+# PEFT imports for LoRA adapter support
+try:
+    from peft import PeftModel
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
 
 # LangGraph imports
 from langgraph.graph import StateGraph, END
@@ -559,12 +566,62 @@ def load_model(model_spec: str, openrouter_api_key: Optional[str] = None):
         model_name = model_spec[3:]
         model_name = normalize_hf_model_name(model_name)
         print(f"Loading HuggingFace model: {model_name}")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16,
-            device_map="auto"
-        )
+        
+        # Check if this is a PEFT checkpoint (has adapter_config.json)
+        adapter_config_path = os.path.join(model_name, 'adapter_config.json')
+        if os.path.exists(adapter_config_path):
+            if not PEFT_AVAILABLE:
+                raise ImportError(
+                    "PEFT checkpoint detected but 'peft' library is not installed. "
+                    "Install it with: pip install peft"
+                )
+            
+            print("Detected PEFT/LoRA checkpoint. Loading base model + adapter...")
+            
+            # Load adapter config to get base model name
+            import json
+            with open(adapter_config_path, 'r') as f:
+                adapter_config = json.load(f)
+                base_model_name = adapter_config.get('base_model_name_or_path', 'Qwen/Qwen2.5-14B-Instruct')
+            
+            print(f"Base model: {base_model_name}")
+            print(f"Adapter: {model_name}")
+            
+            # Load base model with quantization (same as training)
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True
+            )
+            
+            tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                quantization_config=bnb_config,
+                device_map="auto",
+                trust_remote_code=True
+            )
+            
+            # Load adapter
+            model = PeftModel.from_pretrained(base_model, model_name)
+            # Merge adapter into base model for faster inference
+            print("Merging adapter into base model...")
+            model = model.merge_and_unload()
+            
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.padding_side = "right"
+        else:
+            # Regular full model
+            print("Loading full model...")
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True
+            )
+        
         return {'type': 'hf', 'model': model, 'tokenizer': tokenizer}
     
     elif model_spec.startswith('ollama:'):
@@ -922,6 +979,7 @@ class AgentState(TypedDict):
     db_uri: str
     include_schema: bool
     use_finetuned_schema: bool
+    process_mode: str  # 'complete', 'artifacts_only', 'evaluation_only'
 
 
 def generate_sql_node(state: AgentState) -> AgentState:
@@ -1083,6 +1141,19 @@ def calculate_deep_em(generated_sql: str, benchmark_item: Dict[str, Any]) -> Dic
 
 def execute_sql_node(state: AgentState) -> AgentState:
     """Execute current SQL and update state."""
+    # Skip DB execution in artifacts_only mode
+    if state.get('process_mode') == 'artifacts_only':
+        state['current_execution'] = {
+            'success': None,  # Mark as not evaluated
+            'result': None,
+            'rowcount': 0,
+            'duration_ms': 0,
+            'error': 'DB evaluation skipped (artifacts_only mode)'
+        }
+        # In artifacts_only mode, we don't check success, just generate SQL
+        state['success'] = False  # Will be evaluated later
+        return state
+    
     execution_output = execute_sql(state['current_sql'], state['db_uri'])
     state['current_execution'] = execution_output
     
@@ -1135,6 +1206,10 @@ def correction_node(state: AgentState) -> AgentState:
 
 def should_continue(state: AgentState) -> str:
     """Decide whether to continue iteration or end."""
+    # In artifacts_only mode, always stop after first generation (no correction needed)
+    if state.get('process_mode') == 'artifacts_only':
+        return "end"
+    
     if state['success']:
         return "end"
     if state['iteration'] >= state['max_iterations']:
@@ -1482,6 +1557,163 @@ def save_partial_results(
 
 
 # ============================================================================
+# EVALUATION-ONLY MODE: Load artifacts and evaluate
+# ============================================================================
+
+def evaluate_artifacts_only(
+    artifact_file: Path,
+    benchmark: List[Dict[str, Any]],
+    db_uri: str,
+    output_file: Optional[Path] = None
+) -> Dict[str, Any]:
+    """
+    Load existing artifacts and evaluate them against the database.
+    Used when process_mode is 'evaluation_only'.
+    """
+    print("\nEvaluating existing artifacts against database...")
+    
+    # Load artifacts
+    artifacts = []
+    if not artifact_file.exists():
+        raise FileNotFoundError(f"Artifact file not found: {artifact_file}")
+    
+    print(f"Loading artifacts from: {artifact_file}")
+    with open(artifact_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                artifacts.append(json.loads(line))
+    
+    print(f"Loaded {len(artifacts)} artifacts")
+    
+    # Test DB connection
+    print("Testing database connection...")
+    test_execution = execute_sql("SELECT 1;", db_uri)
+    if not test_execution['success']:
+        print(f"\n⚠ ERROR: Database connection failed!")
+        print(f"  Error: {test_execution.get('error', 'Unknown error')}")
+        raise ConnectionError(f"Database connection failed: {test_execution.get('error')}")
+    print("✓ Database connection successful")
+    
+    # Create benchmark_id -> benchmark_item mapping
+    benchmark_dict = {item['benchmark_id']: item for item in benchmark}
+    
+    taxonomy_metrics = TaxonomyMetrics()
+    results = []
+    fs_correct = 0
+    ea_correct = 0
+    deep_em_correct = 0
+    sc_correct = 0
+    total_iterations = 0
+    self_corrections = 0
+    
+    # Evaluate each artifact
+    for artifact in tqdm(artifacts, desc="Evaluating artifacts"):
+        benchmark_id = artifact['benchmark_id']
+        benchmark_item = benchmark_dict.get(benchmark_id)
+        
+        if not benchmark_item:
+            print(f"Warning: Benchmark item {benchmark_id} not found, skipping")
+            continue
+        
+        final_sql = artifact.get('final_sql', '')
+        ground_truth_sql = benchmark_item['sql_postgis']
+        ground_truth_result = benchmark_item.get('expected_result')
+        
+        # Execute SQL
+        execution_output = execute_sql(final_sql, db_uri)
+        
+        # Check first-shot success (if iterations_used == 1)
+        iterations_used = artifact.get('iterations_used', 1)
+        first_shot_success = False
+        if iterations_used == 1:
+            if execution_output['success'] and ground_truth_result is not None:
+                if is_subset_match(execution_output['result'], ground_truth_result):
+                    first_shot_success = True
+                    fs_correct += 1
+        
+        # Check eventual success
+        success = False
+        if execution_output['success'] and ground_truth_result is not None:
+            if is_subset_match(execution_output['result'], ground_truth_result):
+                success = True
+                ea_correct += 1
+                if iterations_used > 1:
+                    self_corrections += 1
+        
+        total_iterations += iterations_used
+        
+        # Calculate EA score
+        max_iterations = artifact.get('max_iterations', 5)
+        ea_score = calculate_ea_score(iterations_used, success, max_iterations)
+        
+        # Calculate deep_EM
+        deep_em_result = calculate_deep_em(final_sql, benchmark_item)
+        deep_em_pass = deep_em_result['deep_em_pass']
+        if deep_em_pass:
+            deep_em_correct += 1
+        
+        # Update artifact with execution results
+        artifact['final_execution'] = execution_output
+        artifact['first_shot_success'] = first_shot_success
+        artifact['eventual_success'] = success
+        artifact['ea_score'] = ea_score
+        artifact['deep_em'] = deep_em_result
+        
+        # Calculate semantic correctness
+        sc_pass = calculate_semantic_correctness(artifact)
+        if sc_pass:
+            sc_correct += 1
+        
+        # Add to taxonomy metrics
+        classification = artifact.get('classification', {})
+        if classification:
+            taxonomy_metrics.add_sample(
+                classification,
+                ex=first_shot_success,
+                ea=success,
+                deep_em=deep_em_pass,
+                sc=sc_pass
+            )
+        
+        results.append(artifact)
+    
+    # Calculate final metrics
+    total = len(results)
+    avg_iterations = total_iterations / total if total > 0 else 0
+    fs_accuracy = fs_correct / total if total > 0 else 0
+    ea_accuracy = ea_correct / total if total > 0 else 0
+    deep_em_accuracy = deep_em_correct / total if total > 0 else 0
+    sc_accuracy = sc_correct / total if total > 0 else 0
+    sc_rate = self_corrections / (total - fs_correct) if (total - fs_correct) > 0 else 0
+    avg_ea_score = sum(r['ea_score'] for r in results) / total if total > 0 else 0
+    avg_deep_em_score = sum(r['deep_em']['deep_em_score'] for r in results) / total if total > 0 else 0
+    
+    return {
+        'mode': 'Q2SQL_EA_v2',
+        'max_iterations': max(r.get('max_iterations', 5) for r in results) if results else 5,
+        'process_mode': 'evaluation_only',
+        'overall': {
+            'total_samples': total,
+            'first_shot_correct': fs_correct,
+            'eventual_correct': ea_correct,
+            'deep_em_correct': deep_em_correct,
+            'semantic_correct': sc_correct,
+            'self_corrections': self_corrections,
+            'ex_accuracy': fs_accuracy,
+            'ea_accuracy': ea_accuracy,
+            'deep_em_accuracy': deep_em_accuracy,
+            'semantic_correctness': sc_accuracy,
+            'self_correction_rate': sc_rate,
+            'average_iterations': avg_iterations,
+            'average_ea_score': avg_ea_score,
+            'average_deep_em_score': avg_deep_em_score
+        },
+        'taxonomy_metrics': taxonomy_metrics.get_summary(),
+        'results': results
+    }
+
+
+# ============================================================================
 # MAIN EVALUATION FUNCTION
 # ============================================================================
 
@@ -1495,15 +1727,29 @@ def evaluate_ea_q2sql_v2(
     use_finetuned_schema: bool,
     artifact_file: Optional[Path] = None,
     output_file: Optional[Path] = None,
-    model_spec: Optional[str] = None
+    model_spec: Optional[str] = None,
+    process_mode: str = 'complete'
 ) -> Dict[str, Any]:
     """Evaluate Q2SQL with EA and taxonomy-based metrics with resume capability."""
     print("\nEvaluating Q2SQL with EA (Eventual Accuracy) and Taxonomy Analysis...")
+    print(f"Process mode: {process_mode}")
     print(f"Max iterations: {max_iterations}")
     if use_finetuned_schema:
         print("Schema context: FINE-TUNED MINI-SCHEMA")
     elif include_schema:
         print("Schema context: FULL DATABASE SCHEMA")
+    
+    # Test DB connection in complete mode
+    if process_mode == 'complete':
+        print("Testing database connection...")
+        test_execution = execute_sql("SELECT 1;", db_uri)
+        if not test_execution['success']:
+            print(f"\n⚠ ERROR: Database connection failed!")
+            print(f"  Error: {test_execution.get('error', 'Unknown error')}")
+            print(f"\n  Suggestion: Run with --process_mode artifacts_only to generate SQL without DB,")
+            print(f"  then run with --process_mode evaluation_only to evaluate artifacts later.")
+            raise ConnectionError(f"Database connection failed: {test_execution.get('error')}")
+        print("✓ Database connection successful")
     
     # Extract model_spec from model_dict if not provided
     if not model_spec:
@@ -1570,7 +1816,8 @@ def evaluate_ea_q2sql_v2(
             'model_type': model_type,
             'db_uri': db_uri,
             'include_schema': include_schema,
-            'use_finetuned_schema': use_finetuned_schema
+            'use_finetuned_schema': use_finetuned_schema,
+            'process_mode': process_mode
         }
         
         # Run agent with error handling
@@ -1628,6 +1875,7 @@ def evaluate_ea_q2sql_v2(
             'final_sql': final_sql,
             'final_execution': final_execution,
             'iterations_used': iterations_used,
+            'max_iterations': max_iterations,
             'first_shot_success': first_shot_success,
             'eventual_success': success,
             'ea_score': ea_score,
@@ -1670,6 +1918,7 @@ def evaluate_ea_q2sql_v2(
     return {
         'mode': 'Q2SQL_EA_v2',
         'max_iterations': max_iterations,
+        'process_mode': process_mode,
         
         # Overall metrics
         'overall': {
@@ -1896,8 +2145,20 @@ def main():
                        help='OpenRouter API key (can also use OPENROUTER_API_KEY env var)')
     parser.add_argument('--report_file', type=str,
                        help='Output file for human-readable report (default: auto-generated)')
+    parser.add_argument('--process_mode', type=str, default='complete',
+                       choices=['complete', 'artifacts_only', 'evaluation_only'],
+                       help='Process mode: complete (generate+eval), artifacts_only (generate SQL only), evaluation_only (eval existing artifacts)')
+    parser.add_argument('--artifacts_file', type=str,
+                       help='Artifact file to load (required for evaluation_only mode)')
     
     args = parser.parse_args()
+    
+    # Validate process_mode requirements
+    if args.process_mode == 'evaluation_only':
+        if not args.artifacts_file:
+            parser.error("--artifacts_file is required when --process_mode is 'evaluation_only'")
+        if args.no_artifacts:
+            parser.error("--no_artifacts cannot be used with --process_mode 'evaluation_only'")
     
     # Load API key from environment if needed
     if args.model.startswith('openrouter:') and not args.openrouter_api_key:
@@ -1908,35 +2169,60 @@ def main():
     benchmark_path = resolve_cli_path(args.benchmark, ensure_exists=True, description='Benchmark file')
     benchmark = load_benchmark(benchmark_path)
     
-    model_dict = load_model(args.model, args.openrouter_api_key)
-    
-    artifact_file = None
-    if not args.no_artifacts:
-        artifact_base = resolve_cli_path(args.artifacts_dir, ensure_exists=False, description='Artifacts directory')
-        artifact_file = prepare_artifact_file(artifact_base, f"{args.mode}_EA_v2", args.model)
-    
-    # Generate output filenames (before evaluation for partial save capability)
-    mode_lower = args.mode.lower()
-    model_name = args.model.split('/')[-1].replace(':', '_')
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    
-    if args.output:
-        output_file = resolve_cli_path(args.output, ensure_exists=False, description='Output file')
+    # Handle evaluation_only mode
+    if args.process_mode == 'evaluation_only':
+        if not args.artifacts_file:
+            parser.error("--artifacts_file required for evaluation_only mode")
+        artifact_file = resolve_cli_path(args.artifacts_file, ensure_exists=True, description='Artifact file')
+        
+        # Generate output filenames
+        mode_lower = args.mode.lower()
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        if args.output:
+            output_file = resolve_cli_path(args.output, ensure_exists=False, description='Output file')
+        else:
+            artifact_name = artifact_file.stem
+            output_file = Path(f'ea_v2_results_{mode_lower}_{artifact_name}_{timestamp}.json')
+        
+        results = evaluate_artifacts_only(
+            artifact_file,
+            benchmark,
+            args.db_uri,
+            output_file=None  # Will be set below
+        )
     else:
-        output_file = Path(f'ea_v2_results_{mode_lower}_{model_name}_{timestamp}.json')
-    
-    results = evaluate_ea_q2sql_v2(
-        benchmark,
-        model_dict,
-        args.db_uri,
-        args.model_type,
-        args.max_iterations,
-        args.include_schema,
-        args.use_finetuned_schema,
-        artifact_file,
-        output_file,
-        model_spec=args.model
-    )
+        # Complete or artifacts_only mode
+        model_dict = load_model(args.model, args.openrouter_api_key)
+        
+        artifact_file = None
+        if not args.no_artifacts:
+            artifact_base = resolve_cli_path(args.artifacts_dir, ensure_exists=False, description='Artifacts directory')
+            artifact_file = prepare_artifact_file(artifact_base, f"{args.mode}_EA_v2", args.model)
+        
+        # Generate output filenames (before evaluation for partial save capability)
+        mode_lower = args.mode.lower()
+        model_name = args.model.split('/')[-1].replace(':', '_')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        if args.output:
+            output_file = resolve_cli_path(args.output, ensure_exists=False, description='Output file')
+        else:
+            output_file = Path(f'ea_v2_results_{mode_lower}_{model_name}_{timestamp}.json')
+        
+        results = evaluate_ea_q2sql_v2(
+            benchmark,
+            model_dict,
+            args.db_uri,
+            args.model_type,
+            args.max_iterations,
+            args.include_schema,
+            args.use_finetuned_schema,
+            artifact_file,
+            output_file,
+            model_spec=args.model,
+            process_mode=args.process_mode
+        )
     
     results['evaluation_timestamp'] = datetime.now().isoformat()
     results['model'] = args.model
