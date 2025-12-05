@@ -582,7 +582,23 @@ def load_model(model_spec: str, openrouter_api_key: Optional[str] = None):
             import json
             with open(adapter_config_path, 'r') as f:
                 adapter_config = json.load(f)
-                base_model_name = adapter_config.get('base_model_name_or_path', 'Qwen/Qwen2.5-14B-Instruct')
+                base_model_name = adapter_config.get('base_model_name_or_path')
+            
+            # If base model not in config, detect from checkpoint path/name
+            if not base_model_name:
+                model_name_lower = model_name.lower()
+                if 'sqlcoder' in model_name_lower:
+                    base_model_name = 'defog/sqlcoder-7b-2'
+                    print(f"  Detected SQLCoder adapter, using base model: {base_model_name}")
+                elif 'qwen' in model_name_lower:
+                    base_model_name = 'Qwen/Qwen2.5-14B-Instruct'
+                    print(f"  Detected Qwen adapter, using base model: {base_model_name}")
+                else:
+                    raise ValueError(
+                        f"Cannot determine base model for adapter: {model_name}. "
+                        f"Please ensure adapter_config.json contains 'base_model_name_or_path' "
+                        f"or include 'sqlcoder' or 'qwen' in the checkpoint path."
+                    )
             
             print(f"Base model: {base_model_name}")
             print(f"Adapter: {model_name}")
